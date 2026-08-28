@@ -1,0 +1,256 @@
+import sqlite3
+
+import requests
+
+from core import (
+    APPROVED_TOOLS,
+    RazorpayClient,
+    get_exception,
+    init_db,
+    investigate_exception,
+    load_benchmark,
+    razorpay_sync,
+    reconcile,
+    rows,
+    tool_result,
+)
+
+
+def fresh_db() -> sqlite3.Connection:
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    init_db(db)
+    return db
+
+
+def test_benchmark_generates_required_labelled_records():
+    db = fresh_db()
+    result = load_benchmark(db)
+    labels = {r["label"] for r in rows(db, "select distinct label from payments")}
+
+    assert result["payments"] >= 500
+    assert {
+        "exact_match",
+        "fee_tax_discrepancy",
+        "refund_mismatch",
+        "duplicate",
+        "missing_settlement",
+        "bank_discrepancy",
+        "wrong_mapping",
+        "timing_mismatch",
+        "unknown_exception",
+    }.issubset(labels)
+
+
+def test_reconciliation_detects_exceptions_without_false_positive_exact_matches():
+    db = fresh_db()
+    load_benchmark(db)
+    result = reconcile(db)
+    detected_labels = {r["label"] for r in rows(db, "select distinct label from exceptions")}
+    detected_types = {r["type"] for r in rows(db, "select distinct type from exceptions")}
+    exact_exceptions = rows(
+        db,
+        """
+        select e.* from exceptions e
+        join payments p on p.id = e.transaction_id
+        where p.label = 'exact_match'
+        """,
+    )
+
+    assert result["total"] >= 500
+    assert result["matched"] > result["exceptions"]
+    assert not exact_exceptions
+    assert "WRONG_MAPPING" in detected_types
+    assert {
+        "fee_tax_discrepancy",
+        "refund_mismatch",
+        "duplicate",
+        "missing_settlement",
+        "bank_discrepancy",
+        "wrong_mapping",
+        "timing_mismatch",
+        "unknown_exception",
+    }.issubset(detected_labels)
+
+
+def test_investigator_uses_only_approved_tools_and_records_evidence():
+    db = fresh_db()
+    load_benchmark(db)
+    reconcile(db)
+    case = rows(db, "select * from exceptions where type = 'MISSING_SETTLEMENT' limit 1")[0]
+    investigated = investigate_exception(db, case["id"])
+
+    assert investigated["evidence"]
+    assert {call["name"] for call in investigated["tool_calls"]}.issubset(APPROVED_TOOLS)
+    assert investigated["ai_summary"]
+    assert investigated["confidence"] > 0
+
+
+def test_insufficient_evidence_routes_to_human_review():
+    db = fresh_db()
+    db.execute(
+        """
+        insert into exceptions (
+            id, transaction_id, severity, type, expected_amount, actual_amount,
+            difference, status, confidence, ai_summary, recommendation,
+            investigation_source, evidence, tool_calls, created_at, resolved_at, label
+        )
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("ex_missing", "pay_missing", "high", "UNKNOWN_EXCEPTION", 1000, 0, -1000, "open", 0.0, "", "", "Deterministic fallback", "[]", "[]", 1, None, "unknown_exception"),
+    )
+    db.commit()
+    investigated = investigate_exception(db, "ex_missing")
+
+    assert investigated["status"] == "human_review"
+    assert investigated["ai_summary"] == "INSUFFICIENT_EVIDENCE"
+
+
+def test_unapproved_tool_is_blocked():
+    try:
+        tool_result("resolve_exception", {})
+    except ValueError as exc:
+        assert "not approved" in str(exc)
+    else:
+        raise AssertionError("unapproved mutation tool was allowed")
+
+
+def test_wrong_mapping_evidence_shows_bad_reference():
+    db = fresh_db()
+    load_benchmark(db)
+    reconcile(db)
+    case = rows(db, "select * from exceptions where type = 'WRONG_MAPPING' limit 1")[0]
+    investigated = investigate_exception(db, case["id"])
+    related = next(item for item in investigated["evidence"] if item["tool"] == "find_related_transactions")
+
+    assert investigated["label"] == "wrong_mapping"
+    assert investigated["type"] == "WRONG_MAPPING"
+    assert related["result"][0]["entity_id"] == investigated["transaction_id"]
+    assert related["result"][0]["payment_id"] != investigated["transaction_id"]
+
+
+def test_gemini_structured_output_is_used_when_available(monkeypatch):
+    db = fresh_db()
+    load_benchmark(db)
+    reconcile(db)
+    case = rows(db, "select * from exceptions where type = 'WRONG_MAPPING' limit 1")[0]
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "steps": [
+                    {
+                        "type": "model_output",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    '{"likely_root_cause":"WRONG_MAPPING",'
+                                    '"explanation":"The recon row references a different payment_id.",'
+                                    '"evidence_summary":["Tool evidence shows mismatched payment_id."],'
+                                    '"confidence":0.93,'
+                                    '"recommendation":"Escalate mapping correction for human approval.",'
+                                    '"requires_human_review":true}'
+                                ),
+                            }
+                        ],
+                    }
+                ]
+            }
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: Response())
+    investigated = investigate_exception(db, case["id"])
+
+    assert investigated["investigation_source"] == "Gemini AI"
+    assert investigated["confidence"] == 0.93
+    assert investigated["status"] == "human_review"
+
+
+def test_malformed_gemini_response_falls_back(monkeypatch):
+    db = fresh_db()
+    load_benchmark(db)
+    reconcile(db)
+    case = rows(db, "select * from exceptions limit 1")[0]
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": "not-json"}]}}]}
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: Response())
+    investigated = investigate_exception(db, case["id"])
+
+    assert investigated["investigation_source"] == "Deterministic fallback"
+    assert investigated["ai_summary"]
+
+
+def test_razorpay_pagination_fetches_until_short_page(monkeypatch):
+    client = object.__new__(RazorpayClient)
+    client.key_id = "rzp_test_key"
+    client.key_secret = "secret"
+    calls = []
+
+    def fake_get(path, params=None):
+        calls.append((path, dict(params)))
+        if params["skip"] == 0:
+            return {"items": [{"id": "a"}, {"id": "b"}]}
+        if params["skip"] == 2:
+            return {"items": [{"id": "c"}]}
+        return {"items": []}
+
+    monkeypatch.setattr(client, "get", fake_get)
+    result = client.fetch_all("/payments", {"count": 2, "skip": 0, "from": 100, "to": 200}, count=2)
+
+    assert [item["id"] for item in result["items"]] == ["a", "b", "c"]
+    assert [call[1]["skip"] for call in calls] == [0, 2]
+    assert all(call[1]["from"] == 100 and call[1]["to"] == 200 for call in calls)
+
+
+def test_razorpay_payments_pagination_respects_page_limit(monkeypatch):
+    client = object.__new__(RazorpayClient)
+    client.key_id = "rzp_test_key"
+    client.key_secret = "secret"
+    calls = []
+
+    def fake_get(path, params=None):
+        calls.append((path, dict(params)))
+        return {"items": []}
+
+    monkeypatch.setattr(client, "get", fake_get)
+    client.fetch_payments(count=1000)
+
+    assert calls[0][1]["count"] == 100
+
+
+def test_razorpay_sync_scopes_payments_and_settlements_to_period(monkeypatch):
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def fetch_settlements(self, **kwargs):
+            self.calls.append(("settlements", kwargs))
+            return {"items": []}
+
+        def fetch_recon(self, year, month, day):
+            self.calls.append(("recon", {"year": year, "month": month, "day": day}))
+            return {"items": []}
+
+        def fetch_payments(self, **kwargs):
+            self.calls.append(("payments", kwargs))
+            return {"items": []}
+
+    client = Client()
+    monkeypatch.setattr("core.RazorpayClient", lambda: client)
+    result = razorpay_sync(fresh_db(), 2026, 8, 5)
+
+    assert result == {"payments": 0, "settlements": 0, "reconciliation_records": 0}
+    assert client.calls[0][1] == {"from_ts": 1785888000, "to_ts": 1785974399}
+    assert client.calls[1][1] == {"year": 2026, "month": 8, "day": 5}
+    assert client.calls[2][1] == {"from_ts": 1785888000, "to_ts": 1785974399}
