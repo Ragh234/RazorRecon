@@ -20,6 +20,7 @@ from core import (
     DB_PATH,
     connect,
     dashboard,
+    deterministic_flag_reason,
     evaluation,
     get_exception,
     human_decision,
@@ -55,6 +56,10 @@ def count_rows(name: str) -> int:
     return conn.execute(f"select count(*) from {name}").fetchone()[0]
 
 
+def format_percent(value):
+    return f"{value}%" if value is not None else "N/A (no ground truth)"
+
+
 initial_metrics = dashboard(conn)
 if initial_metrics["records_processed"] == 0 and count_rows("payments") == 0:
     first_run = load_benchmark_and_reconcile()
@@ -67,6 +72,7 @@ elif count_rows("payments") > 0 and count_rows("reconciliation_results") == 0:
 
 st.title("RazorRecon")
 st.caption("Deterministic financial truth with constrained AI investigation.")
+st.info("All metrics shown for the included benchmark are synthetic and reproducible (fixed seed 42); they are not production-accuracy claims.")
 
 left, right = st.columns([2, 1])
 with right:
@@ -107,10 +113,10 @@ with left:
     cards[5].metric("Unresolved value", f"INR {unresolved_rupees / 100000:.2f}L")
     cards[5].caption(f"INR {unresolved_rupees:,.2f}")
     result_cards = st.columns(4)
-    result_cards[0].metric("Accuracy", f"{metrics['reconciliation_accuracy']}%")
-    result_cards[1].metric("Precision", f"{metrics['exception_precision']}%")
-    result_cards[2].metric("Recall", f"{metrics['exception_recall']}%")
-    throughput = st.session_state.get("last_throughput")
+    result_cards[0].metric("Accuracy", format_percent(metrics["reconciliation_accuracy"]))
+    result_cards[1].metric("Precision", format_percent(metrics["exception_precision"]))
+    result_cards[2].metric("Recall", format_percent(metrics["exception_recall"]))
+    throughput = metrics["throughput_per_second"] or st.session_state.get("last_throughput")
     result_cards[3].metric("Throughput", f"{throughput:,.2f}/s" if throughput else "Run reconciliation")
 
 tabs = st.tabs(["Reconciliation", "Exceptions", "Investigation", "Evaluation", "Audit"])
@@ -122,6 +128,19 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("Exception queue")
     exceptions = table(conn, "exceptions")
+    st.markdown("#### Exception taxonomy")
+    taxonomy = metrics["exception_breakdown"]
+    taxonomy_display = [
+        {
+            "Exception Type": item["exception_type"],
+            "Count": item["count"],
+            "Percentage": f"{item['percentage']:.2f}%",
+            "Unresolved Value": f"INR {item['unresolved_value'] / 100:,.2f}",
+        }
+        for item in taxonomy
+    ]
+    st.dataframe(taxonomy_display, use_container_width=True, hide_index=True)
+    st.markdown("#### Inspect exceptions")
     st.dataframe(
         exceptions[["id", "transaction_id", "actual_amount", "difference", "type", "severity", "confidence", "status"]] if not exceptions.empty else exceptions,
         use_container_width=True,
@@ -133,40 +152,74 @@ with tabs[2]:
     selected = st.selectbox("Exception ID", exception_ids)
     if selected:
         case = get_exception(conn, selected)
+        st.markdown("### FINANCIAL TRUTH — deterministic engine")
+        st.caption("Verified reconciliation output. Gemini cannot alter these records or amounts.")
         c1, c2, c3 = st.columns(3)
         c1.metric("Expected", f"INR {case['expected_amount'] / 100:,.2f}")
         c2.metric("Actual", f"INR {case['actual_amount'] / 100:,.2f}")
         c3.metric("Difference", f"INR {case['difference'] / 100:,.2f}")
 
         st.markdown(f"**Status:** `{case['status']}`  **Type:** `{case['type']}`  **Severity:** `{case['severity']}`")
-        st.markdown(f"**Investigation source:** `{case.get('investigation_source', 'Deterministic fallback')}`")
+        st.markdown(f"**Why flagged:** {deterministic_flag_reason(case['type'])}")
         st.graphviz_chart(f'digraph {{ rankdir=LR; payment [label="{case["transaction_id"]}"]; exception [label="{case["type"]}"]; review [label="{case["status"]}"]; payment -> exception -> review; }}')
 
-        a, b, c = st.columns(3)
-        if a.button("Investigate", use_container_width=True):
+        st.markdown("#### VERIFIED EVIDENCE")
+        st.code(json.dumps(case["evidence"], indent=2), language="json")
+
+        st.markdown("### AI INVESTIGATION — explanation only")
+        st.caption("Gemini is downstream of deterministic reconciliation and has read-only evidence access.")
+        if st.button("Investigate exception", use_container_width=True):
             case = investigate_exception(conn, selected)
-        if b.button("Resolve", use_container_width=True):
+        st.markdown(f"**Investigation source:** `{case.get('investigation_source', 'Deterministic fallback')}`")
+        st.markdown(f"**Likely root cause:** {case['likely_root_cause'] or 'Awaiting investigation.'}")
+        st.write(case["ai_summary"] or "No investigation has run yet.")
+        st.markdown("**Evidence summary**")
+        if case["evidence_summary"]:
+            for summary in case["evidence_summary"]:
+                st.write(f"- {summary}")
+        else:
+            st.write("Awaiting investigation.")
+        st.progress(min(float(case["confidence"]), 1.0), text=f"Confidence: {case['confidence']:.2f}")
+        st.markdown(f"**Recommendation:** {case['recommendation'] or 'Awaiting investigation.'}")
+
+        st.markdown("### HUMAN REVIEW — financial decision")
+        review_text = "Required before any unresolved financial issue is closed." if case["requires_human_review"] else "Gemini did not request review; RazorRecon still leaves resolution to a human."
+        st.warning(review_text)
+        a, b = st.columns(2)
+        if a.button("Resolve as human reviewer", use_container_width=True):
             human_decision(conn, selected, "resolve")
             case = get_exception(conn, selected)
-        if c.button("Escalate", use_container_width=True):
+        if b.button("Escalate as human reviewer", use_container_width=True):
             human_decision(conn, selected, "escalate")
             case = get_exception(conn, selected)
 
-        st.subheader("AI explanation")
-        st.write(case["ai_summary"] or "No investigation has run yet.")
-        st.progress(min(float(case["confidence"]), 1.0), text=f"Confidence: {case['confidence']:.2f}")
-        st.write(case["recommendation"] or "Awaiting investigation.")
-
-        st.subheader("Tool calls")
-        st.dataframe(case["tool_calls"], use_container_width=True)
-        st.subheader("Evidence")
-        st.code(json.dumps(case["evidence"], indent=2), language="json")
-        st.subheader("Audit history")
-        st.dataframe(case["audit_history"], use_container_width=True)
+        with st.expander("Investigation tool calls and audit history"):
+            st.dataframe(case["tool_calls"], use_container_width=True)
+            st.dataframe(case["audit_history"], use_container_width=True)
 
 with tabs[3]:
-    st.subheader("Benchmark metrics")
-    st.json(evaluation(conn))
+    st.subheader("Synthetic held-out benchmark")
+    st.caption("The held-out split is generated reproducibly but its labels are never supplied to the reconciliation engine.")
+    held_out = evaluation(conn, "held_out")
+    held_cards = st.columns(5)
+    held_cards[0].metric("Held-out records", held_out["records_processed"])
+    held_cards[1].metric("Accuracy", format_percent(held_out["reconciliation_accuracy"]))
+    held_cards[2].metric("Precision", format_percent(held_out["exception_precision"]))
+    held_cards[3].metric("Recall", format_percent(held_out["exception_recall"]))
+    error_counts = f"{held_out['false_positives']} / {held_out['false_negatives']}" if held_out["false_positives"] is not None else "N/A"
+    held_cards[4].metric("False + / False -", error_counts)
+    held_breakdown = [
+        {
+            "Exception Type": item["exception_type"],
+            "Count": item["count"],
+            "Percentage": f"{item['percentage']:.2f}%",
+            "Unresolved Value": f"INR {item['unresolved_value'] / 100:,.2f}",
+        }
+        for item in held_out["exception_breakdown"]
+    ]
+    st.dataframe(held_breakdown, use_container_width=True, hide_index=True)
+    with st.expander("Full held-out metrics"):
+        st.json(held_out)
 
 with tabs[4]:
     st.subheader("Audit events")

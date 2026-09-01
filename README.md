@@ -4,13 +4,13 @@ RazorRecon is a compact AI Finance Controller demo for Razorpay reconciliation. 
 
 ## Features
 
-- Reproducible synthetic benchmark with 540 payments and labelled exception cases.
+- Reproducible synthetic benchmark with 5,000 varied payments, a fixed seed, and separate development and held-out splits.
 - Deterministic reconciliation for ID matching, settlement linkage, fee/tax adjustment, refunds, duplicates, timing windows, bank UTR checks, missing settlements, and amount discrepancies.
 - Machine-readable reason codes for every reconciliation result.
 - Read-only investigation tools with guardrails against fabricated evidence or direct financial mutation.
 - Gemini investigation for exception explanations when `LLM_API_KEY` is configured, with deterministic fallback when it is not.
 - Human review actions for resolve/escalate, written to an audit trail.
-- Evaluation metrics calculated from actual benchmark runs.
+- Held-out evaluation metrics and exception taxonomy calculated from actual benchmark runs.
 - Streamlit demo dashboard, exception queue, investigation view, evaluation page, and audit table.
 - Razorpay Test Mode connector separated from synthetic benchmark data.
 
@@ -80,6 +80,36 @@ Demo flow:
 6. Review investigation source, tool calls, evidence, confidence, recommendation, and audit history.
 7. Click **Resolve** or **Escalate** to record a human decision.
 
+## Benchmark Methodology
+
+The included benchmark is entirely synthetic. It is designed to make reconciliation behavior measurable and reproducible; it is not a claim about production accuracy.
+
+- Default size: 5,000 payment records.
+- Fixed random seed: `42`.
+- Split: 4,000 development-style records and 1,000 held-out records (80/20, stratified by scenario).
+- Variation: payment amounts, fee rates, payment methods, timestamps, settlement timing, discrepancies, and identifiers are generated from the seeded random generator. Records are not duplicated copies of a smaller fixture.
+- Ground truth: stored separately for every payment with its split, scenario, expected status, and expected exception type.
+- Independence boundary: reconciliation queries only financial source columns. It does not receive the ground-truth label or expected result. Ground truth is joined only after deterministic results have been written, for evaluation and test compatibility.
+
+The held-out set is scored independently after reconciliation. Reported metrics include total records, matches, exceptions, match rate, exact classification accuracy, exception precision and recall, false positives, false negatives, measured throughput, unresolved exception count/value, and exception counts by type.
+
+Metric definitions:
+
+- **Accuracy**: percentage whose matched/exception status is correct and, for exceptions, whose deterministic exception type exactly matches ground truth.
+- **Precision**: true exception detections divided by all predicted exceptions.
+- **Recall**: detected ground-truth exceptions divided by all ground-truth exceptions.
+- **Unresolved value**: sum of the absolute reconciliation differences for open, human-review, or escalated exceptions. It is an exposure indicator, not a ledger balance.
+
+Exception taxonomy includes `WRONG_MAPPING`, `MISSING_RECONCILIATION_RECORD`, `AMOUNT_MISMATCH`, `DUPLICATE_RECONCILIATION_RECORD`, `MISSING_SETTLEMENT`, `TIMING_WINDOW_EXCEEDED`, `REFUND_AMOUNT_MISMATCH`, `SETTLEMENT_AMOUNT_DISCREPANCY`, and `BANK_UTR_AMOUNT_MISMATCH`. Counts, percentages, and unresolved values are calculated from each run; no example totals are hardcoded.
+
+For `WRONG_MAPPING`, the generated evidence preserves the intended semantics: `entity_id` is the original payment ID and `payment_id` is the incorrect payment ID.
+
+## AI Safety Boundary
+
+Financial truth comes only from deterministic Python reconciliation. Gemini runs only after a verified exception is selected, receives read-only evidence, and cannot mutate payments, settlements, reconciliation records, or bank entries. Any unresolved financial decision remains a human action recorded in the audit trail.
+
+If `LLM_API_KEY` is absent, the API request fails, the response is malformed, or structured-output validation fails, RazorRecon continues with its evidence-grounded deterministic fallback. The UI always identifies the investigation source as either `Gemini AI` or `Deterministic fallback`.
+
 ## Streamlit Community Cloud Deployment
 
 Use `app.py` as the Streamlit entry point.
@@ -133,20 +163,9 @@ Deployment steps:
 python evaluation.py
 ```
 
-Last verified benchmark run:
+The CLI uses an isolated in-memory SQLite database, generates the default seeded dataset, and prints both the complete benchmark and held-out report in a demo-ready format. Running it does not modify `razorrecon.sqlite`.
 
-```text
-records processed: 540
-matched: 360
-exceptions: 180
-match rate: 66.67%
-throughput: 5725.73 records/second
-exception precision: 100.0%
-exception recall: 100.0%
-reconciliation accuracy: 100.0%
-false positives: 0
-false negatives: 0
-```
+Results should be described as: "On the included synthetic held-out benchmark..." They must not be presented as production accuracy.
 
 ## Tests
 
@@ -154,7 +173,7 @@ false negatives: 0
 python -m pytest
 ```
 
-The tests cover benchmark labels, deterministic reconciliation, exact-match false-positive safety, wrong mapping detection, approved investigation tools, Gemini/fallback behavior, evidence recording, insufficient-evidence routing, mutation-tool blocking, and Razorpay pagination.
+The tests cover 5,000-record generation, fixed-seed reproducibility, held-out independence and metrics, required exception classes, false-positive/false-negative safety, wrong mapping semantics, approved investigation tools, Gemini structured validation and failure fallback, evidence recording, insufficient-evidence routing, mutation-tool blocking, and Razorpay pagination.
 
 ## File Map
 
@@ -170,3 +189,5 @@ The tests cover benchmark labels, deterministic reconciliation, exact-match fals
 - Gemini investigation requires `LLM_API_KEY`; without it, the deterministic evidence-grounded fallback remains fully usable.
 - Razorpay Test Mode sync requires valid Test Mode keys and actual account data; the benchmark path remains separate and reliable for demos.
 - No autonomous refunds, payouts, or financial mutations exist.
+- Synthetic benchmark behavior does not establish performance or accuracy on production Razorpay or bank data.
+- Throughput is machine-dependent and is measured for the complete local benchmark run, not claimed as a service-level guarantee.

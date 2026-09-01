@@ -30,6 +30,9 @@ def load_env_file(path: str = ".env") -> None:
 load_env_file()
 DB_PATH = os.getenv("DATABASE_URL", "razorrecon.sqlite").replace("sqlite:///", "")
 GEMINI_MODEL = "gemini-3.5-flash-lite"
+BENCHMARK_RECORDS = 5_000
+BENCHMARK_SEED = 42
+HELD_OUT_FRACTION = 0.20
 APPROVED_TOOLS = {
     "get_payment",
     "get_settlement",
@@ -109,6 +112,23 @@ def init_db(db: sqlite3.Connection) -> None:
             difference integer not null,
             created_at integer not null
         );
+        create table if not exists benchmark_ground_truth (
+            payment_id text primary key,
+            dataset_split text not null,
+            scenario text not null,
+            expected_status text not null,
+            expected_exception_type text,
+            seed integer not null
+        );
+        create table if not exists reconciliation_runs (
+            id text primary key,
+            records integer not null,
+            matched integer not null,
+            exceptions integer not null,
+            elapsed_seconds real not null,
+            throughput_per_second real not null,
+            created_at integer not null
+        );
         create table if not exists exceptions (
             id text primary key,
             transaction_id text not null,
@@ -122,6 +142,9 @@ def init_db(db: sqlite3.Connection) -> None:
             ai_summary text not null,
             recommendation text not null,
             investigation_source text not null default 'Deterministic fallback',
+            likely_root_cause text not null default '',
+            evidence_summary text not null default '[]',
+            requires_human_review integer not null default 1,
             evidence text not null,
             tool_calls text not null,
             created_at integer not null,
@@ -140,6 +163,9 @@ def init_db(db: sqlite3.Connection) -> None:
         """
     )
     ensure_column(db, "exceptions", "investigation_source", "text not null default 'Deterministic fallback'")
+    ensure_column(db, "exceptions", "likely_root_cause", "text not null default ''")
+    ensure_column(db, "exceptions", "evidence_summary", "text not null default '[]'")
+    ensure_column(db, "exceptions", "requires_human_review", "integer not null default 1")
     db.commit()
 
 
@@ -154,6 +180,8 @@ def reset_data(db: sqlite3.Connection) -> None:
         "audit_events",
         "exceptions",
         "reconciliation_results",
+        "reconciliation_runs",
+        "benchmark_ground_truth",
         "bank_entries",
         "reconciliation_records",
         "settlements",
@@ -178,48 +206,87 @@ def audit(db: sqlite3.Connection, actor: str, action: str, entity_id: str, befor
     )
 
 
-def load_benchmark(db: sqlite3.Connection, records: int = 540, seed: int = 42) -> dict[str, int]:
-    reset_data(db)
-    random.seed(seed)
-    base = 1_785_542_400
-    distribution = {
-        "exact_match": 360,
-        "fee_tax_discrepancy": 36,
-        "refund_mismatch": 24,
-        "duplicate": 24,
-        "missing_settlement": 24,
-        "bank_discrepancy": 24,
-        "wrong_mapping": 24,
-        "timing_mismatch": 12,
-        "unknown_exception": 12,
+def _benchmark_distribution(records: int) -> dict[str, int]:
+    if records < 11:
+        raise ValueError("Benchmark requires at least 11 records so every scenario is represented")
+    weights = {
+        "exact_match": 70,
+        "fee_tax_discrepancy": 3,
+        "refund_mismatch": 3,
+        "duplicate": 3,
+        "missing_settlement": 3,
+        "bank_discrepancy": 3,
+        "wrong_mapping": 3,
+        "timing_mismatch": 3,
+        "unknown_exception": 3,
+        "missing_reconciliation_record": 3,
+        "amount_mismatch": 3,
     }
-    if records > sum(distribution.values()):
-        distribution["exact_match"] += records - sum(distribution.values())
+    raw = {label: records * weight / 100 for label, weight in weights.items()}
+    counts = {label: max(1, int(value)) for label, value in raw.items()}
+    difference = records - sum(counts.values())
+    order = sorted(weights, key=lambda label: raw[label] - int(raw[label]), reverse=difference > 0)
+    cursor = 0
+    while difference:
+        label = order[cursor % len(order)]
+        if difference > 0:
+            counts[label] += 1
+            difference -= 1
+        elif counts[label] > 1:
+            counts[label] -= 1
+            difference += 1
+        cursor += 1
+    return counts
+
+
+def load_benchmark(db: sqlite3.Connection, records: int = BENCHMARK_RECORDS, seed: int = BENCHMARK_SEED) -> dict[str, int]:
+    reset_data(db)
+    rng = random.Random(seed)
+    base = 1_785_542_400
+    distribution = _benchmark_distribution(records)
+    expected_types = {
+        "fee_tax_discrepancy": "SETTLEMENT_AMOUNT_DISCREPANCY",
+        "refund_mismatch": "REFUND_AMOUNT_MISMATCH",
+        "duplicate": "DUPLICATE_RECONCILIATION_RECORD",
+        "missing_settlement": "MISSING_SETTLEMENT",
+        "bank_discrepancy": "BANK_UTR_AMOUNT_MISMATCH",
+        "wrong_mapping": "WRONG_MAPPING",
+        "timing_mismatch": "TIMING_WINDOW_EXCEEDED",
+        "unknown_exception": "SETTLEMENT_AMOUNT_DISCREPANCY",
+        "missing_reconciliation_record": "MISSING_RECONCILIATION_RECORD",
+        "amount_mismatch": "AMOUNT_MISMATCH",
+    }
 
     index = 1
     for label, count in distribution.items():
-        for _ in range(count):
-            amount = random.randint(300, 9000) * 100
-            fee = round(amount * 0.02)
+        held_out_count = max(1, round(count * HELD_OUT_FRACTION))
+        split_order = ["held_out"] * held_out_count + ["development"] * (count - held_out_count)
+        rng.shuffle(split_order)
+        for scenario_index in range(count):
+            amount = rng.randint(300, 90_000) * 100 + rng.choice([0, 25, 50, 75])
+            fee_rate = rng.choice([0.015, 0.018, 0.02, 0.022, 0.025])
+            fee = round(amount * fee_rate)
             tax = round(fee * 0.18)
             expected = amount - fee - tax
-            payment_id = f"pay_bench_{index:04d}"
-            settlement_id = f"setl_bench_{index:04d}"
+            payment_id = f"pay_bench_{index:05d}"
+            settlement_id = f"setl_bench_{index:05d}"
             utr = f"UTR{202608000000 + index}"
-            created_at = base + index * 1800
-            settled_at = created_at + 172800
+            created_at = base + index * rng.randint(75, 240)
+            settled_at = created_at + rng.randint(1, 4) * 86400 + rng.randint(0, 3600)
             settlement_amount = expected
             recon_payment_id = payment_id
             recon_settlement_id: str | None = settlement_id
             recon_created_at = settled_at
             bank_amount = settlement_amount
             create_settlement = True
+            create_reconciliation = True
+            recon_amount = amount
 
             if label == "fee_tax_discrepancy":
-                settlement_amount = expected + random.choice([-1, 1]) * random.randint(50, 450)
+                settlement_amount = expected + rng.choice([-1, 1]) * rng.randint(50, 450)
                 bank_amount = settlement_amount
             elif label == "refund_mismatch":
-                settlement_amount = expected - random.randint(5000, min(25000, max(5001, expected // 2)))
+                settlement_amount = expected - rng.randint(5000, min(25000, max(5001, expected // 2)))
                 bank_amount = settlement_amount
             elif label == "missing_settlement":
                 create_settlement = False
@@ -227,28 +294,33 @@ def load_benchmark(db: sqlite3.Connection, records: int = 540, seed: int = 42) -
                 settlement_amount = 0
                 bank_amount = 0
             elif label == "bank_discrepancy":
-                bank_amount = expected - random.randint(100, 900)
+                bank_amount = expected - rng.randint(100, 900)
             elif label == "wrong_mapping":
-                recon_payment_id = f"pay_wrong_{index:04d}"
+                recon_payment_id = f"pay_wrong_{index:05d}"
             elif label == "timing_mismatch":
                 recon_created_at = created_at + 864000
             elif label == "unknown_exception":
-                settlement_amount = expected - random.randint(900, 1700)
-                bank_amount = settlement_amount + random.randint(200, 600)
+                settlement_amount = expected - rng.randint(900, 1700)
+                bank_amount = settlement_amount + rng.randint(200, 600)
+            elif label == "missing_reconciliation_record":
+                create_reconciliation = False
+            elif label == "amount_mismatch":
+                recon_amount = amount + rng.choice([-1, 1]) * rng.randint(100, 5000)
 
             db.execute(
                 "insert into payments values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (payment_id, f"order_{index:04d}", amount, "INR", "captured", random.choice(["card", "upi", "netbanking"]), created_at + 60, created_at, label),
+                (payment_id, f"order_{index:05d}", amount, "INR", "captured", rng.choice(["card", "upi", "netbanking", "wallet"]), created_at + rng.randint(5, 120), created_at, label),
             )
             if create_settlement:
                 db.execute(
                     "insert into settlements values (?, ?, ?, ?, ?, ?, ?)",
                     (settlement_id, settlement_amount, "processed", fee, tax, utr, settled_at),
                 )
-            db.execute(
-                "insert into reconciliation_records values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (f"recon_{index:04d}", payment_id if label == "wrong_mapping" else recon_payment_id, "payment", recon_settlement_id, recon_payment_id, None, None, None, amount, fee, tax, "credit", recon_created_at),
-            )
+            if create_reconciliation:
+                db.execute(
+                    "insert into reconciliation_records values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (f"recon_{index:05d}", payment_id if label == "wrong_mapping" else recon_payment_id, "payment", recon_settlement_id, recon_payment_id, None, None, None, recon_amount, fee, tax, "credit", recon_created_at),
+                )
             db.execute(
                 "insert into bank_entries values (?, ?, ?, ?, ?, ?)",
                 (f"bank_{index:04d}", settlement_id, utr, bank_amount, settled_at + 3600, f"Razorpay settlement {settlement_id}"),
@@ -256,25 +328,47 @@ def load_benchmark(db: sqlite3.Connection, records: int = 540, seed: int = 42) -
             if label == "duplicate":
                 db.execute(
                     "insert into reconciliation_records values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (f"recon_{index:04d}_dupe", payment_id, "payment", settlement_id, payment_id, None, None, None, amount, fee, tax, "credit", recon_created_at + 5),
+                    (f"recon_{index:05d}_dupe", payment_id, "payment", settlement_id, payment_id, None, None, None, amount, fee, tax, "credit", recon_created_at + 5),
                 )
             if label == "refund_mismatch":
                 db.execute(
                     "insert into reconciliation_records values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (f"recon_{index:04d}_refund", f"rfnd_{index:04d}", "refund", settlement_id, payment_id, f"rfnd_{index:04d}", None, None, expected - settlement_amount + 700, 0, 0, "debit", recon_created_at),
+                    (f"recon_{index:05d}_refund", f"rfnd_{index:05d}", "refund", settlement_id, payment_id, f"rfnd_{index:05d}", None, None, expected - settlement_amount + 700, 0, 0, "debit", recon_created_at),
                 )
+            db.execute(
+                "insert into benchmark_ground_truth values (?, ?, ?, ?, ?, ?)",
+                (
+                    payment_id,
+                    split_order[scenario_index],
+                    label,
+                    "matched" if label == "exact_match" else "exception",
+                    expected_types.get(label),
+                    seed,
+                ),
+            )
             index += 1
 
-    audit(db, "system", "BENCHMARK_LOADED", "benchmark", None, {"payments": index - 1})
+    audit(db, "system", "BENCHMARK_LOADED", "benchmark", None, {"payments": index - 1, "seed": seed, "held_out_fraction": HELD_OUT_FRACTION})
     db.commit()
-    return {"payments": index - 1, "reconciliation_records": scalar(db, "select count(*) from reconciliation_records")}
+    return {
+        "payments": index - 1,
+        "development_records": scalar(db, "select count(*) from benchmark_ground_truth where dataset_split = 'development'"),
+        "held_out_records": scalar(db, "select count(*) from benchmark_ground_truth where dataset_split = 'held_out'"),
+        "reconciliation_records": scalar(db, "select count(*) from reconciliation_records"),
+        "seed": seed,
+    }
 
 
 def reconcile(db: sqlite3.Connection) -> dict[str, Any]:
     start = time.perf_counter()
     db.execute("delete from reconciliation_results")
     db.execute("delete from exceptions")
-    payments = rows(db, "select * from payments")
+    # Ground-truth labels are deliberately excluded: the financial engine receives
+    # only source fields and is evaluated against labels after reconciliation.
+    payments = rows(
+        db,
+        "select id, order_id, amount, currency, status, method, captured_at, created_at from payments",
+    )
     matched = 0
     exception_count = 0
     for payment in payments:
@@ -323,13 +417,30 @@ def reconcile(db: sqlite3.Connection) -> dict[str, Any]:
                     "[]",
                     now_ts(),
                     None,
-                    payment["label"],
+                    "unlabelled",
                 ),
             )
+    # Compatibility-only annotation happens after every financial result is fixed.
+    # It is never read by reconcile_payment and cannot affect classification.
+    db.execute(
+        """
+        update exceptions
+        set label = coalesce(
+            (select scenario from benchmark_ground_truth where payment_id = exceptions.transaction_id),
+            label
+        )
+        """
+    )
     elapsed = time.perf_counter() - start
-    audit(db, "system", "RECONCILIATION_RUN", "reconciliation", None, {"matched": matched, "exceptions": exception_count})
+    throughput = round(len(payments) / elapsed, 2) if elapsed else 0
+    run_id = f"run_{time.time_ns()}"
+    db.execute(
+        "insert into reconciliation_runs values (?, ?, ?, ?, ?, ?, ?)",
+        (run_id, len(payments), matched, exception_count, elapsed, throughput, now_ts()),
+    )
+    audit(db, "system", "RECONCILIATION_RUN", "reconciliation", None, {"matched": matched, "exceptions": exception_count, "throughput_per_second": throughput})
     db.commit()
-    return {"total": len(payments), "matched": matched, "exceptions": exception_count, "throughput_per_second": round(len(payments) / elapsed, 2) if elapsed else 0}
+    return {"total": len(payments), "matched": matched, "exceptions": exception_count, "elapsed_seconds": round(elapsed, 4), "throughput_per_second": throughput}
 
 
 def reconcile_payment(db: sqlite3.Connection, payment: sqlite3.Row) -> dict[str, Any]:
@@ -355,6 +466,10 @@ def reconcile_payment(db: sqlite3.Connection, payment: sqlite3.Row) -> dict[str,
         status, reason, severity = "exception", "MISSING_RECONCILIATION_RECORD", "high"
     elif payment_rows[0]["entity_id"] != payment["id"]:
         status, reason, severity = "exception", "PAYMENT_ID_MISMATCH", "high"
+    elif payment_rows[0]["amount"] != payment["amount"]:
+        expected = payment["amount"]
+        actual = payment_rows[0]["amount"]
+        status, reason, severity = "exception", "AMOUNT_MISMATCH", "high"
     elif not settlement:
         status, reason, severity = "exception", "MISSING_SETTLEMENT", "high"
     elif abs(payment_rows[0]["created_at"] - payment["captured_at"]) > 7 * 86400:
@@ -415,21 +530,27 @@ def investigate_exception(db: sqlite3.Connection, exception_id: str) -> dict[str
     llm_result = gemini_investigation(dict(case), evidence)
     if llm_result:
         summary = f"{llm_result['likely_root_cause']}: {llm_result['explanation']}"
+        likely_root_cause = llm_result["likely_root_cause"]
+        evidence_summary = llm_result["evidence_summary"]
         confidence = llm_result["confidence"]
         recommendation = llm_result["recommendation"]
         source = "Gemini AI"
         requires_human_review = llm_result["requires_human_review"]
     else:
         summary, confidence, recommendation = classify_case(dict(case), evidence)
+        likely_root_cause = case["type"] if summary != "INSUFFICIENT_EVIDENCE" else "INSUFFICIENT_EVIDENCE"
+        evidence_summary = summarize_evidence(evidence)
         source = "Deterministic fallback"
-        requires_human_review = False
+        requires_human_review = True
     status = "human_review" if confidence < 0.7 or summary == "INSUFFICIENT_EVIDENCE" else case["status"]
     if requires_human_review:
         status = "human_review"
     db.execute(
         """
         update exceptions
-        set confidence = ?, ai_summary = ?, recommendation = ?, investigation_source = ?, evidence = ?, tool_calls = ?, status = ?
+        set confidence = ?, ai_summary = ?, recommendation = ?, investigation_source = ?,
+            likely_root_cause = ?, evidence_summary = ?, requires_human_review = ?,
+            evidence = ?, tool_calls = ?, status = ?
         where id = ?
         """,
         (
@@ -437,6 +558,9 @@ def investigate_exception(db: sqlite3.Connection, exception_id: str) -> dict[str
             summary,
             recommendation,
             source,
+            likely_root_cause,
+            json.dumps(evidence_summary),
+            int(requires_human_review),
             json.dumps(evidence),
             json.dumps([{"name": t["tool"], "allowed": t["tool"] in APPROVED_TOOLS} for t in tool_outputs]),
             status,
@@ -545,9 +669,13 @@ def validate_llm_result(value: Any) -> dict[str, Any] | None:
     for key, expected_type in required.items():
         if key not in value or not isinstance(value[key], expected_type):
             return None
+    if any(not value[key].strip() for key in ("likely_root_cause", "explanation", "recommendation")):
+        return None
     if not all(isinstance(item, str) for item in value["evidence_summary"]):
         return None
-    confidence = max(0.0, min(1.0, float(value["confidence"])))
+    if isinstance(value["confidence"], bool) or not 0 <= float(value["confidence"]) <= 1:
+        return None
+    confidence = float(value["confidence"])
     return {
         "likely_root_cause": value["likely_root_cause"],
         "explanation": value["explanation"],
@@ -575,6 +703,31 @@ def classify_case(case: dict[str, Any], evidence: list[dict[str, Any]]) -> tuple
     return explanations.get(case["type"], ("INSUFFICIENT_EVIDENCE", 0.55, "Escalate because the available evidence does not support a confident cause."))
 
 
+def summarize_evidence(evidence: list[dict[str, Any]]) -> list[str]:
+    summaries = []
+    for item in evidence:
+        result = item["result"]
+        count = len(result) if isinstance(result, list) else 1
+        summaries.append(f"{item['tool']} returned {count} verified record{'s' if count != 1 else ''}.")
+    return summaries
+
+
+def deterministic_flag_reason(exception_type: str) -> str:
+    reasons = {
+        "WRONG_MAPPING": "The reconciliation entity_id is the original payment ID, while payment_id points to a different payment.",
+        "MISSING_RECONCILIATION_RECORD": "A captured payment has no payment reconciliation record.",
+        "AMOUNT_MISMATCH": "The reconciliation record amount differs from the captured payment amount.",
+        "DUPLICATE_RECONCILIATION_RECORD": "More than one payment reconciliation record exists for the payment.",
+        "MISSING_SETTLEMENT": "The reconciliation record has no available linked settlement.",
+        "TIMING_WINDOW_EXCEEDED": "The reconciliation timestamp falls outside the deterministic seven-day window.",
+        "REFUND_AMOUNT_MISMATCH": "The net settlement differs after applying verified refund records.",
+        "SETTLEMENT_AMOUNT_DISCREPANCY": "The settlement amount differs from payment less verified fees, tax, and refunds.",
+        "BANK_UTR_AMOUNT_MISMATCH": "The bank UTR matches, but the bank and settlement amounts differ.",
+        "PAYMENT_ID_MISMATCH": "The payment reconciliation entity does not match the captured payment ID.",
+    }
+    return reasons.get(exception_type, "The deterministic reconciliation checks did not satisfy a known match condition.")
+
+
 def human_decision(db: sqlite3.Connection, exception_id: str, decision: str) -> None:
     if decision not in {"resolve", "escalate"}:
         raise ValueError("Human decision must be resolve or escalate")
@@ -590,38 +743,79 @@ def human_decision(db: sqlite3.Connection, exception_id: str, decision: str) -> 
     db.commit()
 
 
-def evaluation(db: sqlite3.Connection) -> dict[str, Any]:
-    payments = rows(db, "select * from payments")
-    results = rows(db, "select * from reconciliation_results")
-    exceptions = rows(db, "select * from exceptions")
-    positives = {p["id"] for p in payments if p["label"] != "exact_match"}
-    predicted = {e["transaction_id"] for e in exceptions}
+def evaluation(db: sqlite3.Connection, dataset_split: str | None = None) -> dict[str, Any]:
+    if dataset_split not in {None, "development", "held_out"}:
+        raise ValueError("dataset_split must be development, held_out, or None")
+    truth_query = "select * from benchmark_ground_truth"
+    params: tuple[Any, ...] = ()
+    if dataset_split:
+        truth_query += " where dataset_split = ?"
+        params = (dataset_split,)
+    truth = rows(db, truth_query, params)
+    truth_by_id = {item["payment_id"]: item for item in truth}
+    has_ground_truth = bool(truth)
+    payment_ids = set(truth_by_id)
+    if not has_ground_truth and dataset_split is None:
+        payment_ids = {item["id"] for item in rows(db, "select id from payments")}
+    results = [r for r in rows(db, "select * from reconciliation_results") if r["payment_id"] in payment_ids]
+    exceptions = [e for e in rows(db, "select * from exceptions") if e["transaction_id"] in payment_ids]
+    result_by_id = {r["payment_id"]: r for r in results}
+    exception_by_id = {e["transaction_id"]: e for e in exceptions}
+    positives = {payment_id for payment_id, item in truth_by_id.items() if item["expected_status"] == "exception"}
+    predicted = set(exception_by_id)
     tp = len(positives & predicted)
     fp = len(predicted - positives)
     fn = len(positives - predicted)
-    tn = len({p["id"] for p in payments} - positives - predicted)
-    investigated = [e for e in exceptions if json.loads(e["tool_calls"])]
-    auto_resolved = [e for e in investigated if e["confidence"] >= 0.85 and e["status"] == "resolved"]
-    total = len(payments)
+    tn = len(payment_ids - positives - predicted)
+    correctly_classified = sum(
+        1
+        for payment_id, expected in truth_by_id.items()
+        if payment_id in result_by_id
+        and result_by_id[payment_id]["status"] == expected["expected_status"]
+        and (
+            expected["expected_status"] == "matched"
+            or result_by_id[payment_id]["reason_code"] == expected["expected_exception_type"]
+        )
+    )
+    unresolved_statuses = {"open", "human_review", "escalated"}
+    unresolved = [e for e in exceptions if e["status"] in unresolved_statuses]
+    breakdown = []
+    for exception_type in sorted({e["type"] for e in exceptions}):
+        typed = [e for e in exceptions if e["type"] == exception_type]
+        typed_unresolved = [e for e in typed if e["status"] in unresolved_statuses]
+        breakdown.append(
+            {
+                "exception_type": exception_type,
+                "count": len(typed),
+                "percentage": pct(len(typed), len(exceptions)),
+                "unresolved_value": sum(abs(e["difference"]) for e in typed_unresolved),
+            }
+        )
+    latest_run = row(db, "select * from reconciliation_runs order by rowid desc limit 1")
+    matched = len([r for r in results if r["status"] == "matched"])
+    seed = truth[0]["seed"] if truth else None
     return {
-        "records_processed": total,
-        "matched": len([r for r in results if r["status"] == "matched"]),
+        "dataset": "synthetic benchmark" if truth else "unlabelled data",
+        "dataset_split": dataset_split or "all",
+        "seed": seed,
+        "records_processed": len(payment_ids),
+        "matched": matched,
         "exceptions": len(exceptions),
-        "match_rate": pct(len([r for r in results if r["status"] == "matched"]), len(results)),
-        "exception_precision": pct(tp, tp + fp),
-        "exception_recall": pct(tp, tp + fn),
-        "reconciliation_accuracy": pct(tp + tn, total),
-        "false_positives": fp,
-        "false_negatives": fn,
-        "unresolved_exceptions": len([e for e in exceptions if e["status"] in {"open", "human_review", "escalated"}]),
-        "auto_resolution_rate": pct(len(auto_resolved), len(investigated)),
+        "match_rate": pct(matched, len(results)),
+        "exception_precision": pct(tp, tp + fp) if has_ground_truth else None,
+        "exception_recall": pct(tp, tp + fn) if has_ground_truth else None,
+        "reconciliation_accuracy": pct(correctly_classified, len(truth)) if has_ground_truth else None,
+        "false_positives": fp if has_ground_truth else None,
+        "false_negatives": fn if has_ground_truth else None,
+        "throughput_per_second": latest_run["throughput_per_second"] if latest_run else 0,
+        "unresolved_exceptions": len(unresolved),
+        "unresolved_value": sum(abs(e["difference"]) for e in unresolved),
+        "exception_breakdown": breakdown,
     }
 
 
 def dashboard(db: sqlite3.Connection) -> dict[str, Any]:
     metrics = evaluation(db)
-    unresolved_value = scalar(db, "select coalesce(sum(abs(difference)), 0) from exceptions where status in ('open', 'human_review', 'escalated')")
-    metrics["unresolved_value"] = unresolved_value
     metrics["recent_investigations"] = [dict(r) for r in rows(db, "select id, transaction_id, type, status, confidence from exceptions order by created_at desc limit 5")]
     return metrics
 
@@ -782,6 +976,8 @@ def get_exception(db: sqlite3.Connection, exception_id: str) -> dict[str, Any]:
         raise ValueError("Exception not found")
     data = dict(case)
     data["evidence"] = json.loads(data["evidence"])
+    data["evidence_summary"] = json.loads(data["evidence_summary"])
+    data["requires_human_review"] = bool(data["requires_human_review"])
     data["tool_calls"] = json.loads(data["tool_calls"])
     data["audit_history"] = [dict(r) for r in rows(db, "select * from audit_events where entity_id = ? order by timestamp desc", (exception_id,))]
     return data

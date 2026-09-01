@@ -5,6 +5,7 @@ import requests
 from core import (
     APPROVED_TOOLS,
     RazorpayClient,
+    evaluation,
     get_exception,
     init_db,
     investigate_exception,
@@ -13,6 +14,7 @@ from core import (
     reconcile,
     rows,
     tool_result,
+    validate_llm_result,
 )
 
 
@@ -28,7 +30,9 @@ def test_benchmark_generates_required_labelled_records():
     result = load_benchmark(db)
     labels = {r["label"] for r in rows(db, "select distinct label from payments")}
 
-    assert result["payments"] >= 500
+    assert result["payments"] == 5000
+    assert result["development_records"] + result["held_out_records"] == 5000
+    assert 900 <= result["held_out_records"] <= 1100
     assert {
         "exact_match",
         "fee_tax_discrepancy",
@@ -40,6 +44,83 @@ def test_benchmark_generates_required_labelled_records():
         "timing_mismatch",
         "unknown_exception",
     }.issubset(labels)
+
+
+def test_benchmark_is_reproducible_with_fixed_seed():
+    first = fresh_db()
+    second = fresh_db()
+    load_benchmark(first, records=220, seed=73)
+    load_benchmark(second, records=220, seed=73)
+
+    query = """
+        select p.id, p.amount, p.method, p.created_at, g.dataset_split, g.scenario,
+               g.expected_status, g.expected_exception_type
+        from payments p join benchmark_ground_truth g on g.payment_id = p.id
+        order by p.id
+    """
+    assert [tuple(item) for item in rows(first, query)] == [tuple(item) for item in rows(second, query)]
+
+
+def test_held_out_evaluation_is_complete_and_independent():
+    db = fresh_db()
+    load_benchmark(db, records=550, seed=42)
+    financial_columns = []
+
+    def capture(statement):
+        if statement.lower().startswith("select id, order_id"):
+            financial_columns.append(statement.lower())
+
+    db.set_trace_callback(capture)
+    reconcile(db)
+    db.set_trace_callback(None)
+    held_out = evaluation(db, "held_out")
+    types = {item["exception_type"] for item in held_out["exception_breakdown"]}
+
+    assert financial_columns
+    assert all("label" not in statement and "ground_truth" not in statement for statement in financial_columns)
+    assert held_out["records_processed"] > 0
+    assert held_out["false_positives"] == 0
+    assert held_out["false_negatives"] == 0
+    assert held_out["reconciliation_accuracy"] == 100.0
+    assert {"WRONG_MAPPING", "MISSING_RECONCILIATION_RECORD", "AMOUNT_MISMATCH"}.issubset(types)
+
+
+def test_required_exception_types_match_ground_truth():
+    db = fresh_db()
+    load_benchmark(db, records=550, seed=42)
+    reconcile(db)
+    detected = {
+        item["scenario"]: item["reason_code"]
+        for item in rows(
+            db,
+            """
+            select g.scenario, r.reason_code
+            from benchmark_ground_truth g
+            join reconciliation_results r on r.payment_id = g.payment_id
+            where g.scenario in ('wrong_mapping', 'missing_reconciliation_record', 'amount_mismatch')
+            """,
+        )
+    }
+
+    assert detected == {
+        "wrong_mapping": "WRONG_MAPPING",
+        "missing_reconciliation_record": "MISSING_RECONCILIATION_RECORD",
+        "amount_mismatch": "AMOUNT_MISMATCH",
+    }
+
+
+def test_unlabelled_operational_data_does_not_claim_accuracy():
+    db = fresh_db()
+    load_benchmark(db, records=110)
+    reconcile(db)
+    db.execute("delete from benchmark_ground_truth")
+    metrics = evaluation(db)
+
+    assert metrics["records_processed"] == 110
+    assert metrics["matched"] + metrics["exceptions"] == 110
+    assert metrics["reconciliation_accuracy"] is None
+    assert metrics["exception_precision"] is None
+    assert metrics["exception_recall"] is None
 
 
 def test_reconciliation_detects_exceptions_without_false_positive_exact_matches():
@@ -86,7 +167,8 @@ def test_investigator_uses_only_approved_tools_and_records_evidence():
     assert investigated["confidence"] > 0
 
 
-def test_insufficient_evidence_routes_to_human_review():
+def test_insufficient_evidence_routes_to_human_review(monkeypatch):
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
     db = fresh_db()
     db.execute(
         """
@@ -188,6 +270,37 @@ def test_malformed_gemini_response_falls_back(monkeypatch):
     investigated = investigate_exception(db, case["id"])
 
     assert investigated["investigation_source"] == "Deterministic fallback"
+    assert investigated["ai_summary"]
+
+
+def test_gemini_structured_output_validation_rejects_invalid_fields():
+    invalid = {
+        "likely_root_cause": "WRONG_MAPPING",
+        "explanation": "Evidence-based explanation.",
+        "evidence_summary": ["Verified mismatch."],
+        "confidence": "high",
+        "recommendation": "Review mapping.",
+        "requires_human_review": True,
+    }
+
+    assert validate_llm_result(invalid) is None
+
+
+def test_gemini_api_failure_uses_deterministic_fallback(monkeypatch):
+    db = fresh_db()
+    load_benchmark(db, records=110)
+    reconcile(db)
+    case = rows(db, "select * from exceptions where type = 'AMOUNT_MISMATCH' limit 1")[0]
+
+    def fail_request(*args, **kwargs):
+        raise requests.RequestException("simulated outage")
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(requests, "post", fail_request)
+    investigated = investigate_exception(db, case["id"])
+
+    assert investigated["investigation_source"] == "Deterministic fallback"
+    assert investigated["requires_human_review"] is True
     assert investigated["ai_summary"]
 
 
