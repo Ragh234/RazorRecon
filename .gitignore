@@ -7,7 +7,11 @@ __pycache__/
 .pytest_cache/
 *.pyc
 *.sqlite
+*.sqlite-wal
+*.sqlite-shm
 *.db
+*.db-wal
+*.db-shm
 *.log
 *.key
 *.pem
