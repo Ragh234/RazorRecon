@@ -52,6 +52,13 @@ def now_ts() -> int:
 def connect(path: str | None = None) -> sqlite3.Connection:
     db = sqlite3.connect(path or DB_PATH, check_same_thread=False)
     db.row_factory = sqlite3.Row
+    # Streamlit serves concurrent sessions against one on-disk SQLite file.
+    # Without these, a second session hitting the file mid-write gets an
+    # immediate "database is locked" OperationalError (default timeout is 0).
+    # WAL lets readers and a writer coexist; busy_timeout makes writers wait
+    # instead of failing instantly.
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=5000")
     return db
 
 

@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 
 import streamlit as st
 
@@ -60,15 +61,25 @@ def format_percent(value):
     return f"{value}%" if value is not None else "N/A (no ground truth)"
 
 
-initial_metrics = dashboard(conn)
-if initial_metrics["records_processed"] == 0 and count_rows("payments") == 0:
-    first_run = load_benchmark_and_reconcile()
-    st.session_state.setdefault("last_action", first_run)
-    st.session_state.setdefault("last_throughput", first_run["throughput_per_second"])
-elif count_rows("payments") > 0 and count_rows("reconciliation_results") == 0:
-    first_run = reconcile(conn)
-    st.session_state.setdefault("last_action", first_run)
-    st.session_state.setdefault("last_throughput", first_run["throughput_per_second"])
+try:
+    initial_metrics = dashboard(conn)
+    if initial_metrics["records_processed"] == 0 and count_rows("payments") == 0:
+        first_run = load_benchmark_and_reconcile()
+        st.session_state.setdefault("last_action", first_run)
+        st.session_state.setdefault("last_throughput", first_run["throughput_per_second"])
+    elif count_rows("payments") > 0 and count_rows("reconciliation_results") == 0:
+        first_run = reconcile(conn)
+        st.session_state.setdefault("last_action", first_run)
+        st.session_state.setdefault("last_throughput", first_run["throughput_per_second"])
+except sqlite3.OperationalError:
+    st.warning(
+        "RazorRecon is preparing the demo dataset and the database is briefly busy "
+        "(this happens on a cold start when more than one session connects at once). "
+        "This is not a data problem \u2014 wait a few seconds and retry."
+    )
+    if st.button("Retry now", use_container_width=True):
+        st.rerun()
+    st.stop()
 
 st.title("RazorRecon")
 st.caption("Deterministic financial truth with constrained AI investigation.")
