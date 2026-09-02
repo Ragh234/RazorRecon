@@ -2,7 +2,7 @@
 
 Deployed Link : https://razorrecon-sqdzzsbxwdkzpokgn28xpp.streamlit.app/
 
-> First load can take ~30s: the free-tier host sleeps after a period of inactivity and wakes on the first visit. If it briefly does not respond, wait and reload once rather than retrying repeatedly.
+> First load can take ~30s: the free-tier host sleeps after a period of inactivity and wakes on the first visit, then generates and reconciles the 5,000-record benchmark. Reloading during that window is safe - the app detects a half-finished startup and rebuilds rather than showing partial results.
 
 RazorRecon is a compact AI Finance Controller demo for Razorpay reconciliation. It keeps financial truth deterministic and uses a constrained investigator only to explain exceptions from read-only evidence.
 
@@ -15,6 +15,7 @@ RazorRecon is a compact AI Finance Controller demo for Razorpay reconciliation. 
 - Reproducible synthetic benchmark with 5,000 varied payments, a fixed seed, and separate development and held-out splits.
 - Deterministic reconciliation for ID matching, settlement linkage, fee/tax adjustment, refunds, duplicates, timing windows, bank UTR checks, missing settlements, and amount discrepancies.
 - Machine-readable reason codes for every reconciliation result.
+- Exposure classification that separates money genuinely at risk from settlements that have simply not arrived yet.
 - Read-only investigation tools with guardrails against fabricated evidence or direct financial mutation.
 - Gemini investigation for exception explanations when `LLM_API_KEY` is configured, with deterministic fallback when it is not.
 - Human review actions for resolve/escalate, written to an audit trail.
@@ -78,15 +79,19 @@ Then open the Streamlit URL, usually `http://localhost:8501`.
 
 The app loads and reconciles the synthetic benchmark automatically when the local SQLite database is empty, so a deployed instance works without Razorpay account data.
 
+On startup the app compares row counts rather than checking whether tables are merely non-empty. A page reload during the cold-start run kills that script run, and because the database connection is cached across runs the next run can see the abandoned transaction's partial rows. Treating that as a finished run would report a high match rate with an empty exception queue. When the counts disagree, the app discards the partial write and rebuilds.
+
 Demo flow:
 
 1. Review dashboard metrics from the automatically loaded synthetic benchmark.
 2. Optionally click **Load benchmark** and **Run reconciliation** to reset/replay the demo.
-3. Review records, matched count, match rate, exceptions, accuracy, precision, recall, throughput, and unresolved value.
-4. Open the **Exceptions** tab.
-5. Open **Investigation**, select an exception, and click **Investigate**.
+3. Review records, matched count, match rate, exceptions, accuracy, precision, recall, throughput, and unresolved exposure by class.
+4. Open the **Exceptions** tab for the taxonomy and the queue.
+5. Open **Investigation**, filter by exception type and status, pick a case, and click **Investigate**.
 6. Review investigation source, tool calls, evidence, confidence, recommendation, and audit history.
 7. Click **Resolve** or **Escalate** to record a human decision.
+
+Wide tables are paged to the first 500 rows so a free-tier host is not serialising 5,000 rows to the browser on every interaction. The complete figures are always available from the CLI benchmark.
 
 ## Benchmark Methodology
 
@@ -106,9 +111,20 @@ Metric definitions:
 - **Accuracy**: percentage whose matched/exception status is correct and, for exceptions, whose deterministic exception type exactly matches ground truth.
 - **Precision**: true exception detections divided by all predicted exceptions.
 - **Recall**: detected ground-truth exceptions divided by all ground-truth exceptions.
-- **Unresolved value**: sum of the absolute reconciliation differences for open, human-review, or escalated exceptions. It is an exposure indicator, not a ledger balance.
+- **Unresolved value**: sum of the absolute reconciliation differences for open, human-review, or escalated exceptions. It is an exposure indicator, not a ledger balance, and it is reported split by exposure class rather than as one number.
+- **Throughput**: always measured over the whole reconciliation run. A split is scored afterwards from stored results, so it has no separate timing of its own.
 
-Exception taxonomy includes `WRONG_MAPPING`, `MISSING_RECONCILIATION_RECORD`, `AMOUNT_MISMATCH`, `DUPLICATE_RECONCILIATION_RECORD`, `MISSING_SETTLEMENT`, `TIMING_WINDOW_EXCEEDED`, `REFUND_AMOUNT_MISMATCH`, `SETTLEMENT_AMOUNT_DISCREPANCY`, and `BANK_UTR_AMOUNT_MISMATCH`. Counts, percentages, and unresolved values are calculated from each run; no example totals are hardcoded.
+### Exposure Classes
+
+A reconciliation difference does not mean the same thing for every exception type, so summing them into a single "unresolved value" overstates risk. Each type is classified:
+
+- **Amount at risk** - the ledger disagrees about money that has already moved: `AMOUNT_MISMATCH`, `BANK_UTR_AMOUNT_MISMATCH`, `REFUND_AMOUNT_MISMATCH`, `SETTLEMENT_AMOUNT_DISCREPANCY`, `DUPLICATE_RECONCILIATION_RECORD`.
+- **Awaiting settlement** - no settlement or reconciliation row exists yet, so the difference is the entire payment value. This is pipeline lag, not loss: `MISSING_SETTLEMENT`, `MISSING_RECONCILIATION_RECORD`.
+- **Structural** - the amounts reconcile exactly but the linkage between records is wrong, so the difference is legitimately zero: `WRONG_MAPPING`, `TIMING_WINDOW_EXCEEDED`, `PAYMENT_ID_MISMATCH`.
+
+On the default 5,000-record benchmark this separates roughly INR 1.86 lakh of genuine amount-at-risk from roughly INR 1.38 crore that is only awaiting settlement. An unrecognised exception type is classified as amount at risk rather than quietly discounted.
+
+Exception taxonomy includes `WRONG_MAPPING`, `MISSING_RECONCILIATION_RECORD`, `AMOUNT_MISMATCH`, `DUPLICATE_RECONCILIATION_RECORD`, `MISSING_SETTLEMENT`, `TIMING_WINDOW_EXCEEDED`, `REFUND_AMOUNT_MISMATCH`, `SETTLEMENT_AMOUNT_DISCREPANCY`, and `BANK_UTR_AMOUNT_MISMATCH`. The engine also emits `PAYMENT_ID_MISMATCH`, which the synthetic generator does not produce; it is reachable on Razorpay connector data where a reconciliation row's entity does not match the captured payment. Counts, percentages, and unresolved values are calculated from each run; no example totals are hardcoded.
 
 For `WRONG_MAPPING`, the generated evidence preserves the intended semantics: `entity_id` is the original payment ID and `payment_id` is the incorrect payment ID.
 
@@ -132,6 +148,7 @@ Required repository files for deployment:
 - `evaluation.py`
 - `tests/test_reconciliation.py`
 - `README.md`
+- `assets/architecture.svg`
 - `.env.example`
 - `.gitignore`
 
@@ -181,7 +198,7 @@ Results should be described as: "On the included synthetic held-out benchmark...
 python -m pytest
 ```
 
-The tests cover 5,000-record generation, fixed-seed reproducibility, held-out independence and metrics, required exception classes, false-positive/false-negative safety, wrong mapping semantics, approved investigation tools, Gemini structured validation and failure fallback, evidence recording, insufficient-evidence routing, mutation-tool blocking, and Razorpay pagination.
+The tests cover 5,000-record generation, fixed-seed reproducibility, held-out independence and metrics, required exception classes, false-positive/false-negative safety, wrong mapping semantics, exposure-class partitioning, bank-entry referential integrity, rebuild of a partially written result set, approved investigation tools, Gemini structured validation and failure fallback, evidence recording, insufficient-evidence routing, mutation-tool blocking, and Razorpay pagination.
 
 ## File Map
 
@@ -198,4 +215,5 @@ The tests cover 5,000-record generation, fixed-seed reproducibility, held-out in
 - Razorpay Test Mode sync requires valid Test Mode keys and actual account data; the benchmark path remains separate and reliable for demos.
 - No autonomous refunds, payouts, or financial mutations exist.
 - Synthetic benchmark behavior does not establish performance or accuracy on production Razorpay or bank data.
+- The benchmark scores 100% accuracy, precision, and recall by construction: every scenario the generator produces is drawn from the failure modes the deterministic rules already cover. That result demonstrates rule coverage and guards against regressions. It is not evidence of accuracy on real data, which contains failure modes this generator does not create.
 - Throughput is machine-dependent and is measured for the complete local benchmark run, not claimed as a service-level guarantee.
