@@ -1,4 +1,13 @@
-from core import BENCHMARK_RECORDS, BENCHMARK_SEED, connect, evaluation, init_db, load_benchmark, reconcile
+from core import (
+    BENCHMARK_RECORDS,
+    BENCHMARK_SEED,
+    EXPOSURE_LABELS,
+    connect,
+    evaluation,
+    init_db,
+    load_benchmark,
+    reconcile,
+)
 
 
 def print_report(title: str, metrics: dict) -> None:
@@ -15,13 +24,18 @@ def print_report(title: str, metrics: dict) -> None:
     print(f"Recall: {metrics['exception_recall']:.2f}%")
     print(f"False positives: {metrics['false_positives']:,}")
     print(f"False negatives: {metrics['false_negatives']:,}")
-    print(f"Throughput: {metrics['throughput_per_second']:,.2f} records/second")
+    print(f"Throughput: {metrics['throughput_per_second']:,.2f} records/second ({metrics['throughput_scope']})")
     print(f"Unresolved exceptions: {metrics['unresolved_exceptions']:,}")
     print(f"Unresolved value: INR {metrics['unresolved_value'] / 100:,.2f}")
+    for name, label in EXPOSURE_LABELS.items():
+        print(
+            f"  {label}: INR {metrics['unresolved_value_by_class'][name] / 100:,.2f} "
+            f"across {metrics['unresolved_count_by_class'][name]:,} exceptions"
+        )
     print("Exception breakdown:")
     for item in metrics["exception_breakdown"]:
         print(
-            f"  {item['exception_type']}: {item['count']:,} "
+            f"  {item['exception_type']} [{item['exposure_class']}]: {item['count']:,} "
             f"({item['percentage']:.2f}%), unresolved INR {item['unresolved_value'] / 100:,.2f}"
         )
 

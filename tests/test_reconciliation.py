@@ -123,6 +123,75 @@ def test_unlabelled_operational_data_does_not_claim_accuracy():
     assert metrics["exception_recall"] is None
 
 
+def test_unresolved_value_separates_real_exposure_from_pipeline_lag():
+    db = fresh_db()
+    load_benchmark(db, records=550, seed=42)
+    reconcile(db)
+    metrics = evaluation(db)
+    by_class = metrics["unresolved_value_by_class"]
+
+    # The classes must partition the headline total, not overlap or leak.
+    assert sum(by_class.values()) == metrics["unresolved_value"]
+    assert sum(metrics["unresolved_count_by_class"].values()) == metrics["unresolved_exceptions"]
+    assert metrics["unresolved_amount_at_risk"] == by_class["amount_at_risk"]
+
+    # Missing settlements dominate the raw total but are lag, not loss, so the
+    # at-risk figure must stay well below the undifferentiated sum.
+    assert by_class["awaiting_settlement"] > by_class["amount_at_risk"]
+
+    # Structural exceptions reconcile to the rupee; a non-zero exposure there
+    # would mean the difference calculation had drifted.
+    assert by_class["structural"] == 0
+    assert metrics["unresolved_count_by_class"]["structural"] > 0
+
+    for item in metrics["exception_breakdown"]:
+        assert item["exposure_class"] in {"amount_at_risk", "awaiting_settlement", "structural"}
+
+
+def test_reconcile_rebuilds_a_partially_written_result_set():
+    # Reloading the page mid-run kills that script run, and the cached connection
+    # inherits the abandoned transaction. Because the benchmark writes every
+    # exact-match payment first, a partial result set looks like a healthy run with
+    # a suspiciously high match rate and an empty exception queue. Reconciling again
+    # has to reproduce the full result set rather than append to the fragment.
+    db = fresh_db()
+    load_benchmark(db, records=550, seed=42)
+    complete = reconcile(db)
+
+    db.execute("delete from reconciliation_results")
+    db.execute("delete from exceptions")
+    for index in range(120):
+        db.execute(
+            "insert into reconciliation_results values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (f"rr_partial_{index}", f"pay_bench_{index:05d}", None, "matched", "R", 0, 0, 0, 0),
+        )
+
+    payments = db.execute("select count(*) from payments").fetchone()[0]
+    partial = db.execute("select count(*) from reconciliation_results").fetchone()[0]
+    assert partial != payments  # the signal the app boots on
+    assert db.execute("select count(*) from exceptions").fetchone()[0] == 0
+
+    repaired = reconcile(db)
+
+    assert repaired["total"] == complete["total"]
+    assert repaired["matched"] == complete["matched"]
+    assert repaired["exceptions"] == complete["exceptions"]
+    assert db.execute("select count(*) from reconciliation_results").fetchone()[0] == payments
+
+
+def test_no_bank_entry_exists_without_a_settlement():
+    db = fresh_db()
+    load_benchmark(db, records=550, seed=42)
+
+    orphans = rows(
+        db,
+        "select b.id from bank_entries b "
+        "left join settlements s on s.id = b.reference where s.id is null",
+    )
+
+    assert orphans == []
+
+
 def test_reconciliation_detects_exceptions_without_false_positive_exact_matches():
     db = fresh_db()
     load_benchmark(db)

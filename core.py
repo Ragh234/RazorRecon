@@ -30,6 +30,7 @@ def load_env_file(path: str = ".env") -> None:
 load_env_file()
 DB_PATH = os.getenv("DATABASE_URL", "razorrecon.sqlite").replace("sqlite:///", "")
 GEMINI_MODEL = "gemini-3.5-flash-lite"
+GEMINI_API_REVISION = "2026-05-20"
 BENCHMARK_RECORDS = 5_000
 BENCHMARK_SEED = 42
 HELD_OUT_FRACTION = 0.20
@@ -43,6 +44,36 @@ APPROVED_TOOLS = {
     "compare_bank_entry",
     "calculate_expected_settlement",
 }
+
+# An exception's reconciliation difference does not mean the same thing for every
+# exception type, so a single summed "unresolved value" would be misleading:
+#   amount_at_risk      - the ledger disagrees about money that has already moved.
+#   awaiting_settlement - no settlement or recon row exists yet, so the difference is
+#                         the whole payment. That is pipeline lag, not loss.
+#   structural          - the amounts reconcile but the linkage does not (wrong
+#                         mapping, timing window). The difference is legitimately zero.
+EXPOSURE_CLASS = {
+    "AMOUNT_MISMATCH": "amount_at_risk",
+    "BANK_UTR_AMOUNT_MISMATCH": "amount_at_risk",
+    "REFUND_AMOUNT_MISMATCH": "amount_at_risk",
+    "SETTLEMENT_AMOUNT_DISCREPANCY": "amount_at_risk",
+    "DUPLICATE_RECONCILIATION_RECORD": "amount_at_risk",
+    "MISSING_SETTLEMENT": "awaiting_settlement",
+    "MISSING_RECONCILIATION_RECORD": "awaiting_settlement",
+    "WRONG_MAPPING": "structural",
+    "TIMING_WINDOW_EXCEEDED": "structural",
+    "PAYMENT_ID_MISMATCH": "structural",
+}
+EXPOSURE_LABELS = {
+    "amount_at_risk": "Amount at risk",
+    "awaiting_settlement": "Awaiting settlement",
+    "structural": "Structural (amount reconciles)",
+}
+
+
+def exposure_class(exception_type: str) -> str:
+    # Unknown types are treated as money at risk rather than quietly discounted.
+    return EXPOSURE_CLASS.get(exception_type, "amount_at_risk")
 
 
 def now_ts() -> int:
@@ -328,10 +359,14 @@ def load_benchmark(db: sqlite3.Connection, records: int = BENCHMARK_RECORDS, see
                     "insert into reconciliation_records values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (f"recon_{index:05d}", payment_id if label == "wrong_mapping" else recon_payment_id, "payment", recon_settlement_id, recon_payment_id, None, None, None, recon_amount, fee, tax, "credit", recon_created_at),
                 )
-            db.execute(
-                "insert into bank_entries values (?, ?, ?, ?, ?, ?)",
-                (f"bank_{index:04d}", settlement_id, utr, bank_amount, settled_at + 3600, f"Razorpay settlement {settlement_id}"),
-            )
+            # A bank line can only exist for a settlement that actually happened.
+            # Emitting one for the missing-settlement scenario would put a phantom
+            # zero-value row into the evidence the investigator reads.
+            if create_settlement:
+                db.execute(
+                    "insert into bank_entries values (?, ?, ?, ?, ?, ?)",
+                    (f"bank_{index:05d}", settlement_id, utr, bank_amount, settled_at + 3600, f"Razorpay settlement {settlement_id}"),
+                )
             if label == "duplicate":
                 db.execute(
                     "insert into reconciliation_records values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -632,7 +667,13 @@ def gemini_investigation(case: dict[str, Any], evidence: list[dict[str, Any]]) -
     try:
         response = requests.post(
             "https://generativelanguage.googleapis.com/v1beta/interactions",
-            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+            headers={
+                "x-goog-api-key": api_key,
+                "Content-Type": "application/json",
+                # Pin the Interactions API request/response schema so a future
+                # revision cannot silently push every investigation to fallback.
+                "Api-Revision": GEMINI_API_REVISION,
+            },
             json={
                 "model": GEMINI_MODEL,
                 "input": json.dumps(prompt),
@@ -641,7 +682,9 @@ def gemini_investigation(case: dict[str, Any], evidence: list[dict[str, Any]]) -
                     "mime_type": "application/json",
                     "schema": schema,
                 },
-                "generation_config": {"max_output_tokens": 1200},
+                # Headroom for the JSON body plus any thinking tokens; too low a
+                # ceiling truncates the response and reads as a validation failure.
+                "generation_config": {"max_output_tokens": 2048},
             },
             timeout=20,
         )
@@ -801,11 +844,18 @@ def evaluation(db: sqlite3.Connection, dataset_split: str | None = None) -> dict
         breakdown.append(
             {
                 "exception_type": exception_type,
+                "exposure_class": exposure_class(exception_type),
                 "count": len(typed),
                 "percentage": pct(len(typed), len(exceptions)),
                 "unresolved_value": sum(abs(e["difference"]) for e in typed_unresolved),
             }
         )
+    unresolved_by_class = {name: 0 for name in EXPOSURE_LABELS}
+    unresolved_count_by_class = {name: 0 for name in EXPOSURE_LABELS}
+    for item in unresolved:
+        name = exposure_class(item["type"])
+        unresolved_by_class[name] += abs(item["difference"])
+        unresolved_count_by_class[name] += 1
     latest_run = row(db, "select * from reconciliation_runs order by rowid desc limit 1")
     matched = len([r for r in results if r["status"] == "matched"])
     seed = truth[0]["seed"] if truth else None
@@ -823,8 +873,14 @@ def evaluation(db: sqlite3.Connection, dataset_split: str | None = None) -> dict
         "false_positives": fp if has_ground_truth else None,
         "false_negatives": fn if has_ground_truth else None,
         "throughput_per_second": latest_run["throughput_per_second"] if latest_run else 0,
+        # Throughput is always measured over the whole reconciliation run. A split is
+        # scored after the fact, so there is no separate per-split timing to report.
+        "throughput_scope": "full reconciliation run",
         "unresolved_exceptions": len(unresolved),
         "unresolved_value": sum(abs(e["difference"]) for e in unresolved),
+        "unresolved_value_by_class": unresolved_by_class,
+        "unresolved_count_by_class": unresolved_count_by_class,
+        "unresolved_amount_at_risk": unresolved_by_class["amount_at_risk"],
         "exception_breakdown": breakdown,
     }
 
@@ -981,8 +1037,22 @@ def tool_result(name: str, result: Any) -> dict[str, Any]:
     return {"tool": name, "result": result}
 
 
-def table(db: sqlite3.Connection, name: str) -> pd.DataFrame:
-    return pd.read_sql_query(f"select * from {name}", db)
+def table(db: sqlite3.Connection, name: str, columns: str = "*", limit: int | None = None, order_by: str | None = None) -> pd.DataFrame:
+    # Views can ask for just the columns they render. Pulling the exceptions table
+    # with its evidence and tool_calls JSON blobs on every rerun is the largest
+    # avoidable memory cost in the deployed app.
+    query = f"select {columns} from {name}"
+    if order_by:
+        query += f" order by {order_by}"
+    if limit is not None:
+        query += f" limit {int(limit)}"
+    return pd.read_sql_query(query, db)
+
+
+QUEUE_COLUMNS = (
+    "id, transaction_id, type, severity, expected_amount, actual_amount, "
+    "difference, confidence, status, investigation_source"
+)
 
 
 def get_exception(db: sqlite3.Connection, exception_id: str) -> dict[str, Any]:
