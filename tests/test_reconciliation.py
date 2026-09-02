@@ -304,6 +304,44 @@ def test_gemini_api_failure_uses_deterministic_fallback(monkeypatch):
     assert investigated["ai_summary"]
 
 
+def test_gemini_failure_reason_is_recorded_in_audit_trail(monkeypatch):
+    db = fresh_db()
+    load_benchmark(db, records=110)
+    reconcile(db)
+    case = rows(db, "select * from exceptions where type = 'AMOUNT_MISMATCH' limit 1")[0]
+
+    def fail_request(*args, **kwargs):
+        raise requests.RequestException("simulated outage")
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(requests, "post", fail_request)
+    investigate_exception(db, case["id"])
+
+    fallback_events = rows(
+        db,
+        "select * from audit_events where action = 'GEMINI_FALLBACK' and entity_id = ?",
+        (case["id"],),
+    )
+    assert len(fallback_events) == 1
+    import json as _json
+
+    reason = _json.loads(fallback_events[0]["after_state"])["reason"]
+    assert "RequestException" in reason
+    assert "simulated outage" in reason
+
+
+def test_missing_api_key_does_not_log_a_gemini_failure(monkeypatch):
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    db = fresh_db()
+    load_benchmark(db, records=110)
+    reconcile(db)
+    case = rows(db, "select * from exceptions where type = 'AMOUNT_MISMATCH' limit 1")[0]
+    investigate_exception(db, case["id"])
+
+    fallback_events = rows(db, "select * from audit_events where action = 'GEMINI_FALLBACK'")
+    assert fallback_events == []
+
+
 def test_razorpay_pagination_fetches_until_short_page(monkeypatch):
     client = object.__new__(RazorpayClient)
     client.key_id = "rzp_test_key"

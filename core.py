@@ -534,7 +534,7 @@ def investigate_exception(db: sqlite3.Connection, exception_id: str) -> dict[str
         tool_result("compare_bank_entry", compare_bank_entry(db, settlement_id)),
     ]
     evidence = [t for t in tool_outputs if t["result"] not in (None, [], {})]
-    llm_result = gemini_investigation(dict(case), evidence)
+    llm_result, gemini_failure_reason = gemini_investigation(dict(case), evidence)
     if llm_result:
         summary = f"{llm_result['likely_root_cause']}: {llm_result['explanation']}"
         likely_root_cause = llm_result["likely_root_cause"]
@@ -576,14 +576,19 @@ def investigate_exception(db: sqlite3.Connection, exception_id: str) -> dict[str
     )
     after = dict(row(db, "select * from exceptions where id = ?", (exception_id,)))
     audit(db, "ai_investigator", "EXCEPTION_INVESTIGATED", exception_id, before, after)
+    if gemini_failure_reason:
+        # Only logged when LLM_API_KEY was configured and an attempt actually failed
+        # (missing-key is the normal fallback path and isn't logged as a failure).
+        # Ops-visibility only: never fed back into a prompt or shown as evidence.
+        audit(db, "ai_investigator", "GEMINI_FALLBACK", exception_id, None, {"reason": gemini_failure_reason})
     db.commit()
     return get_exception(db, exception_id)
 
 
-def gemini_investigation(case: dict[str, Any], evidence: list[dict[str, Any]]) -> dict[str, Any] | None:
+def gemini_investigation(case: dict[str, Any], evidence: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, str | None]:
     api_key = os.getenv("LLM_API_KEY")
     if not api_key:
-        return None
+        return None, None
     schema = {
         "type": "object",
         "properties": {
@@ -644,9 +649,12 @@ def gemini_investigation(case: dict[str, Any], evidence: list[dict[str, Any]]) -
         payload = response.json()
         text = extract_gemini_text(payload)
         parsed = json.loads(text)
-        return validate_llm_result(parsed)
-    except Exception:
-        return None
+        result = validate_llm_result(parsed)
+        if result is None:
+            return None, "structured output failed validation"
+        return result, None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
 
 
 def extract_gemini_text(payload: dict[str, Any]) -> str:
