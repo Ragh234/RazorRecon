@@ -1,10 +1,12 @@
 import sqlite3
+import threading
 
 import requests
 
 from core import (
     APPROVED_TOOLS,
     RazorpayClient,
+    connect,
     evaluation,
     get_exception,
     init_db,
@@ -146,6 +148,48 @@ def test_unresolved_value_separates_real_exposure_from_pipeline_lag():
 
     for item in metrics["exception_breakdown"]:
         assert item["exposure_class"] in {"amount_at_risk", "awaiting_settlement", "structural"}
+
+
+def test_concurrent_cold_starts_on_a_shared_connection_need_a_lock():
+    # app.py caches one sqlite3.Connection per process (@st.cache_resource) and every
+    # Streamlit session runs its script in its own thread, so two sessions hitting a
+    # cold start together both see an empty benchmark table and both call
+    # load_benchmark on the SAME connection. Reproduced live on the deployed app as
+    # sqlite3.IntegrityError: UNIQUE constraint failed: benchmark_ground_truth.payment_id,
+    # crashing the page instead of triggering the "database is busy, retry" path,
+    # because IntegrityError is not OperationalError.
+    #
+    # Unguarded, this is flaky by nature (it depends on thread interleaving), so it
+    # isn't asserted here. What's asserted is the fix app.py actually uses: serializing
+    # the bootstrap section with one process-wide lock must produce zero errors and a
+    # fully consistent result, however many sessions race to start it.
+    # fresh_db()'s plain sqlite3.connect() forbids cross-thread use; core.connect()
+    # sets check_same_thread=False, matching what app.py actually shares across
+    # session threads via @st.cache_resource.
+    db = connect(":memory:")
+    init_db(db)
+    lock = threading.Lock()
+    errors = []
+
+    def cold_start():
+        try:
+            with lock:
+                if db.execute("select count(*) from payments").fetchone()[0] == 0:
+                    db.rollback()
+                    load_benchmark(db, records=300, seed=42)
+                    reconcile(db)
+        except Exception as exc:  # pragma: no cover - failure path under test
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=cold_start) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert db.execute("select count(*) from payments").fetchone()[0] == 300
+    assert db.execute("select count(*) from reconciliation_results").fetchone()[0] == 300
 
 
 def test_reconcile_rebuilds_a_partially_written_result_set():

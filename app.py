@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import threading
 from datetime import date, datetime, timezone
 
 import streamlit as st
@@ -49,6 +50,19 @@ def db():
     return connection
 
 
+@st.cache_resource
+def bootstrap_lock() -> threading.Lock:
+    # Streamlit runs every session's script in its own thread but @st.cache_resource
+    # hands them the SAME connection object, so two sessions hitting a cold start at
+    # once both see an empty benchmark table and both start writing it concurrently.
+    # That interleaves two insert loops on one connection and raises IntegrityError
+    # from a UNIQUE collision, not a "database is locked" error, so it wasn't caught
+    # by the retry path below. This lock, cached the same way as db(), makes the
+    # bootstrap section critical: only one thread rebuilds at a time; the rest block,
+    # then see "ready" once they get in and do nothing.
+    return threading.Lock()
+
+
 conn = db()
 
 
@@ -94,14 +108,15 @@ def inr(paise) -> str:
 # Cheap row counts decide the cold-start path. Calling dashboard() here as well would
 # run a full evaluation pass on every rerun purely to learn whether the table is empty.
 try:
-    state = bootstrap_state()
-    if state != "ready":
-        # Drop anything an interrupted run left uncommitted so the rebuild starts clean.
-        conn.rollback()
-        first_run = load_benchmark_and_reconcile() if state == "load" else reconcile(conn)
-        st.session_state["last_action"] = first_run
-        st.session_state["last_throughput"] = first_run["throughput_per_second"]
-except sqlite3.OperationalError:
+    with bootstrap_lock():
+        state = bootstrap_state()
+        if state != "ready":
+            # Drop anything an interrupted run left uncommitted so the rebuild starts clean.
+            conn.rollback()
+            first_run = load_benchmark_and_reconcile() if state == "load" else reconcile(conn)
+            st.session_state["last_action"] = first_run
+            st.session_state["last_throughput"] = first_run["throughput_per_second"]
+except (sqlite3.OperationalError, sqlite3.IntegrityError):
     st.warning(
         "RazorRecon is preparing the demo dataset and the database is briefly busy "
         "(this happens on a cold start when more than one session connects at once). "
