@@ -2,7 +2,13 @@
 
 Deployed Link : https://razorrecon-sqdzzsbxwdkzpokgn28xpp.streamlit.app/
 
+> First load can take ~30s: the free-tier host sleeps after a period of inactivity and wakes on the first visit. If it briefly does not respond, wait and reload once rather than retrying repeatedly.
+
 RazorRecon is a compact AI Finance Controller demo for Razorpay reconciliation. It keeps financial truth deterministic and uses a constrained investigator only to explain exceptions from read-only evidence.
+
+## Architecture
+
+![RazorRecon reconciliation pipeline: Razorpay Test Mode API and a synthetic benchmark feed data ingestion, which feeds deterministic reconciliation in Python — the financial source of truth. Matched payments close automatically; exceptions go to Gemini AI investigation, which works only from read-only verified evidence and falls back deterministically on any failure. Every case ends in human review (resolve or escalate), and every step is written to the audit trail.](assets/architecture.svg)
 
 ## Features
 

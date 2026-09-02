@@ -1,0 +1,100 @@
+<svg viewBox="0 0 760 1090" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica Neue, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5B6472"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="760" height="1090" fill="#FBF9F4"/>
+
+  <text x="380" y="46" text-anchor="middle" font-size="24" font-weight="700" fill="#1C2027">RazorRecon reconciliation pipeline</text>
+  <text x="380" y="70" text-anchor="middle" font-size="13" fill="#5B6472">Deterministic financial truth, constrained AI investigation, human-controlled decisions</text>
+
+  <!-- Sources -->
+  <rect x="60" y="100" width="290" height="70" rx="10" fill="none" stroke="#8B93A0" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="205" y="130" text-anchor="middle" font-size="15" font-weight="600" fill="#1C2027">Razorpay Test Mode API</text>
+  <text x="205" y="150" text-anchor="middle" font-size="11.5" fill="#5B6472">payments &#183; settlements &#183; recon</text>
+
+  <rect x="410" y="100" width="290" height="70" rx="10" fill="none" stroke="#8B93A0" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="555" y="130" text-anchor="middle" font-size="15" font-weight="600" fill="#1C2027">Synthetic benchmark</text>
+  <text x="555" y="150" text-anchor="middle" font-size="11.5" fill="#5B6472">5,000 records, fixed seed 42</text>
+
+  <line x1="205" y1="170" x2="205" y2="200" stroke="#5B6472" stroke-width="1.5"/>
+  <line x1="555" y1="170" x2="555" y2="200" stroke="#5B6472" stroke-width="1.5"/>
+  <line x1="205" y1="200" x2="555" y2="200" stroke="#5B6472" stroke-width="1.5"/>
+  <line x1="380" y1="200" x2="380" y2="222" stroke="#5B6472" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Ingestion -->
+  <rect x="180" y="224" width="400" height="66" rx="10" fill="#FFFFFF" stroke="#DED5C0" stroke-width="1.5"/>
+  <text x="380" y="252" text-anchor="middle" font-size="15" font-weight="600" fill="#1C2027">Data ingestion</text>
+  <text x="380" y="272" text-anchor="middle" font-size="11.5" fill="#5B6472">normalized into SQLite</text>
+
+  <line x1="380" y1="290" x2="380" y2="316" stroke="#5B6472" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Deterministic reconciliation (hero box) -->
+  <rect x="110" y="318" width="540" height="112" rx="12" fill="#16233D"/>
+  <text x="380" y="362" text-anchor="middle" font-size="18" font-weight="700" fill="#F6F3EA">Deterministic reconciliation</text>
+  <text x="380" y="386" text-anchor="middle" font-size="12.5" fill="#C7D0E0">Python &#183; ID matching, fees/tax, refunds, duplicates, timing, UTR checks</text>
+  <text x="380" y="406" text-anchor="middle" font-size="12.5" font-weight="600" fill="#E0AC52">the financial source of truth &#8212; no AI on this path</text>
+
+  <line x1="380" y1="430" x2="380" y2="456" stroke="#5B6472" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="230" y1="456" x2="530" y2="456" stroke="#5B6472" stroke-width="1.5"/>
+  <line x1="230" y1="456" x2="230" y2="472" stroke="#5B6472" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="530" y1="456" x2="530" y2="472" stroke="#5B6472" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Matched / Exception -->
+  <rect x="90" y="474" width="280" height="70" rx="10" fill="#DEEAE0" stroke="#2C6B4B" stroke-width="1.5"/>
+  <text x="230" y="504" text-anchor="middle" font-size="15" font-weight="700" fill="#2C6B4B">Matched</text>
+  <text x="230" y="524" text-anchor="middle" font-size="11.5" fill="#2C6B4B">closed automatically, on dashboard</text>
+
+  <rect x="390" y="474" width="280" height="70" rx="10" fill="#F1E2C4" stroke="#B4791F" stroke-width="1.5"/>
+  <text x="530" y="504" text-anchor="middle" font-size="15" font-weight="700" fill="#8A5C13">Exception</text>
+  <text x="530" y="524" text-anchor="middle" font-size="11.5" fill="#8A5C13">1 of 9 typed reason codes</text>
+
+  <line x1="530" y1="544" x2="530" y2="570" stroke="#5B6472" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Gemini investigation -->
+  <rect x="180" y="572" width="400" height="90" rx="10" fill="#FFFFFF" stroke="#B4791F" stroke-width="2"/>
+  <text x="380" y="600" text-anchor="middle" font-size="15" font-weight="600" fill="#1C2027">Gemini AI investigation</text>
+  <text x="380" y="622" text-anchor="middle" font-size="11.5" fill="#5B6472">read-only verified evidence &#183; schema-validated JSON</text>
+  <text x="380" y="640" text-anchor="middle" font-size="11.5" fill="#5B6472">any failure &#8594; deterministic fallback, reason logged to audit</text>
+  <text x="380" y="655" text-anchor="middle" font-size="11" font-weight="600" fill="#B4791F">cannot mutate a payment, settlement, or ledger row</text>
+
+  <line x1="380" y1="662" x2="380" y2="688" stroke="#5B6472" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Human review -->
+  <rect x="180" y="690" width="400" height="76" rx="10" fill="#FFFFFF" stroke="#DED5C0" stroke-width="1.5"/>
+  <text x="380" y="720" text-anchor="middle" font-size="15" font-weight="600" fill="#1C2027">Human review</text>
+  <text x="380" y="740" text-anchor="middle" font-size="11.5" fill="#5B6472">resolve or escalate &#8212; the only financial decision-maker</text>
+
+  <line x1="380" y1="766" x2="380" y2="792" stroke="#5B6472" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Audit trail -->
+  <rect x="130" y="794" width="500" height="76" rx="10" fill="#FFFFFF" stroke="#DED5C0" stroke-width="1.5" stroke-dasharray="0"/>
+  <text x="380" y="824" text-anchor="middle" font-size="15" font-weight="600" fill="#1C2027">Audit trail</text>
+  <text x="380" y="844" text-anchor="middle" font-size="11.5" fill="#5B6472">every system, AI, and human action &#8212; timestamped and attributed</text>
+
+  <!-- feedback line from matched to audit, going around the right side -->
+  <path d="M 370 509 C 700 509, 700 832, 632 832" fill="none" stroke="#8B93A0" stroke-width="1.3" stroke-dasharray="3 4" marker-end="url(#arrow)"/>
+  <text x="700" y="670" text-anchor="middle" font-size="10.5" fill="#8B93A0" transform="rotate(90 700 670)">matches are audited too</text>
+
+  <!-- Legend -->
+  <g transform="translate(60,900)">
+    <rect x="0" y="0" width="640" height="120" rx="10" fill="none" stroke="#DED5C0" stroke-width="1"/>
+    <text x="18" y="26" font-size="12" font-weight="700" fill="#5B6472" letter-spacing="0.06em">LEGEND</text>
+
+    <rect x="18" y="40" width="16" height="16" rx="3" fill="none" stroke="#8B93A0" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <text x="42" y="53" font-size="12" fill="#1C2027">External / seeded data source</text>
+
+    <rect x="18" y="68" width="16" height="16" rx="3" fill="#16233D"/>
+    <text x="42" y="81" font-size="12" fill="#1C2027">Deterministic system of record</text>
+
+    <rect x="330" y="40" width="16" height="16" rx="3" fill="#F1E2C4" stroke="#B4791F"/>
+    <text x="354" y="53" font-size="12" fill="#1C2027">Exception / constrained AI</text>
+
+    <rect x="330" y="68" width="16" height="16" rx="3" fill="#DEEAE0" stroke="#2C6B4B"/>
+    <text x="354" y="81" font-size="12" fill="#1C2027">Matched / resolved</text>
+  </g>
+
+  <text x="380" y="1050" text-anchor="middle" font-size="11" fill="#8B93A0">RazorRecon &#8212; Razorpay AI Buildathon 2026, AI Finance Controller track</text>
+</svg>
