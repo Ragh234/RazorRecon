@@ -1,7 +1,5 @@
 # RazorRecon
 
-Deployed Link : https://razorrecon.streamlit.app/
-
 > First load can take ~30s: the free-tier host sleeps after a period of inactivity and wakes on the first visit, then generates and reconciles the 5,000-record benchmark. Reloading during that window is safe - the app detects a half-finished startup and rebuilds rather than showing partial results.
 
 RazorRecon is a compact AI Finance Controller demo for Razorpay reconciliation. It keeps financial truth deterministic and uses a constrained investigator only to explain exceptions from read-only evidence.
