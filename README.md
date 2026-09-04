@@ -1,5 +1,10 @@
 # RazorRecon
 
+[![Tests](https://github.com/Ragh234/RazorRecon/actions/workflows/tests.yml/badge.svg)](https://github.com/Ragh234/RazorRecon/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+Built for the Razorpay AI Buildathon, AI Finance Controller track.
+
 Deployed Link : https://razorrecon.streamlit.app/
 
 > First load can take ~30s: the free-tier host sleeps after a period of inactivity and wakes on the first visit, then generates and reconciles the 5,000-record benchmark. Reloading during that window is safe - the app detects a half-finished startup and rebuilds rather than showing partial results.
@@ -104,6 +109,8 @@ The included benchmark is entirely synthetic. It is designed to make reconciliat
 - Ground truth: stored separately for every payment with its split, scenario, expected status, and expected exception type.
 - Independence boundary: reconciliation queries only financial source columns. It does not receive the ground-truth label or expected result. Ground truth is joined only after deterministic results have been written, for evaluation and test compatibility.
 
+This is not one cherry-picked match: every one of the 5,000 records is reconciled on each run, and every one of the 1,000 held-out records is scored against labels the reconciliation engine never saw.
+
 The held-out set is scored independently after reconciliation. Reported metrics include total records, matches, exceptions, match rate, exact classification accuracy, exception precision and recall, false positives, false negatives, measured throughput, unresolved exception count/value, and exception counts by type.
 
 Metric definitions:
@@ -133,6 +140,14 @@ For `WRONG_MAPPING`, the generated evidence preserves the intended semantics: `e
 Financial truth comes only from deterministic Python reconciliation. Gemini runs only after a verified exception is selected, receives read-only evidence, and cannot mutate payments, settlements, reconciliation records, or bank entries. Any unresolved financial decision remains a human action recorded in the audit trail.
 
 If `LLM_API_KEY` is absent, the API request fails, the response is malformed, or structured-output validation fails, RazorRecon continues with its evidence-grounded deterministic fallback. The UI always identifies the investigation source as either `Gemini AI` or `Deterministic fallback`.
+
+## Failure Recovery
+
+Two real failures were found, reproduced, and fixed with a permanent regression test, not just handled in theory.
+
+**Gemini failure.** If `LLM_API_KEY` is missing, the API call errors, the response is malformed, or the structured output fails schema validation, investigation falls back to the deterministic evidence-grounded classifier instead of crashing or guessing. The fallback reason is written to the audit trail (`GEMINI_FALLBACK`), never fed back into a prompt, and never shown as evidence. All three failure paths are covered by tests: `test_malformed_gemini_response_falls_back`, `test_gemini_api_failure_uses_deterministic_fallback`, `test_gemini_structured_output_validation_rejects_invalid_fields`.
+
+**Concurrent cold-start crash.** `@st.cache_resource` hands every Streamlit session the same SQLite connection, and each session runs in its own thread. Two sessions hitting a cold start together both saw an empty benchmark table and both called `load_benchmark` on that shared connection at once, unsynchronized. Their insert loops interleaved and collided on the same deterministic `payment_id` sequence, crashing the app with `sqlite3.IntegrityError: UNIQUE constraint failed`. Reproduced deterministically with 8 threads sharing one connection. Fixed with a single process-wide lock (cached the same way as the connection itself) around the bootstrap section: one thread rebuilds, the rest wait and then see the result. Covered by `test_concurrent_cold_starts_on_a_shared_connection_need_a_lock`.
 
 ## Streamlit Community Cloud Deployment
 
@@ -206,6 +221,8 @@ The tests cover 5,000-record generation, fixed-seed reproducibility, held-out in
 - `core.py` - SQLite schema, benchmark generator, reconciliation engine, Razorpay connector, investigator tools, evaluation, and audit logic.
 - `evaluation.py` - CLI benchmark runner.
 - `tests/test_reconciliation.py` - focused tests for critical financial and guardrail behavior.
+- `.github/workflows/tests.yml` - runs the test suite on every push and pull request.
+- `assets/architecture.svg` - the pipeline diagram referenced above.
 - `.env.example` - required configuration shape.
 - `.gitignore` - excludes secrets, local DBs, caches, and generated artifacts.
 
