@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import threading
 
@@ -9,6 +10,7 @@ from core import (
     audit,
     connect,
     evaluation,
+    gemini_investigation,
     get_exception,
     init_db,
     investigate_exception,
@@ -398,6 +400,75 @@ def test_gemini_structured_output_validation_rejects_invalid_fields():
     }
 
     assert validate_llm_result(invalid) is None
+
+
+def test_transient_gemini_timeout_is_retried_once_before_falling_back(monkeypatch):
+    """A read timeout is the network, not an answer, so it earns one more attempt.
+
+    The audit trail showed real 20s read timeouts and 500s from the Interactions
+    endpoint. Each one spent the whole investigation and pushed the case to the
+    deterministic fallback, so a slow-but-healthy response looked identical to an
+    outage.
+    """
+    calls = []
+
+    def timeout_once_then_succeed(*args, **kwargs):
+        calls.append(kwargs.get("timeout"))
+        if len(calls) == 1:
+            raise requests.Timeout("read timed out")
+
+        class Response:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "output_text": json.dumps(
+                        {
+                            "likely_root_cause": "FEE_TAX_DISCREPANCY",
+                            "explanation": "Settlement is short by the recorded fee.",
+                            "evidence_summary": ["fee 1298", "tax 234"],
+                            "confidence": 0.91,
+                            "recommendation": "Review the fee breakdown.",
+                            "requires_human_review": True,
+                        }
+                    )
+                }
+
+        return Response()
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(requests, "post", timeout_once_then_succeed)
+    result, reason = gemini_investigation({"id": "e1", "transaction_id": "p1", "type": "AMOUNT_MISMATCH",
+                                           "expected_amount": 100, "actual_amount": 90, "difference": -10,
+                                           "severity": "medium", "status": "open"}, [])
+
+    assert len(calls) == 2, "a transient timeout should be retried exactly once"
+    assert reason is None
+    assert result["likely_root_cause"] == "FEE_TAX_DISCREPANCY"
+
+
+def test_non_transient_gemini_failure_is_not_retried(monkeypatch):
+    """A 4xx is a settled answer. Retrying it only delays the fallback."""
+    calls = []
+
+    def unauthorized(*args, **kwargs):
+        calls.append(1)
+        response = requests.Response()
+        response.status_code = 401
+        raise requests.HTTPError("401 Client Error: Unauthorized", response=response)
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setattr(requests, "post", unauthorized)
+    result, reason = gemini_investigation({"id": "e1", "transaction_id": "p1", "type": "AMOUNT_MISMATCH",
+                                           "expected_amount": 100, "actual_amount": 90, "difference": -10,
+                                           "severity": "medium", "status": "open"}, [])
+
+    assert len(calls) == 1, "a 401 must not be retried"
+    assert result is None
+    assert "401" in reason
 
 
 def test_audit_ids_do_not_collide_within_a_single_second():

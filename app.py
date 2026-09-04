@@ -421,9 +421,26 @@ exceptions_df = table(conn, "exceptions", columns=QUEUE_COLUMNS, order_by="id")
 # are paged and the full set stays available through the CLI benchmark.
 TABLE_PREVIEW_ROWS = 500
 
-tabs = st.tabs(["Reconciliation", "Exceptions", "Investigation", "Evaluation", "Audit"])
+SECTIONS = ["Reconciliation", "Exceptions", "Investigation", "Evaluation", "Audit"]
 
-with tabs[0]:
+# st.tabs keeps its selection only in the browser, and it resets to the first tab on
+# every rerun - and in Streamlit every button press is a rerun. So clicking "Investigate
+# exception" dropped the reviewer back on Reconciliation, away from the result they had
+# just asked for, and the same happened on resolve and escalate. A segmented control
+# bound to a session_state key survives reruns, so the section you are working in stays
+# put while the numbers underneath update.
+section = st.segmented_control(
+    "Section",
+    SECTIONS,
+    default=SECTIONS[0],
+    key="section",
+    label_visibility="collapsed",
+)
+# The control is deselectable, and a deselected control returns None. Falling back to
+# the first section keeps the page from rendering nothing at all.
+section = section or SECTIONS[0]
+
+if section == "Reconciliation":
     st.subheader("Reconciliation records")
     total_results = count_rows("reconciliation_results")
     recon_view = table(conn, "reconciliation_results", limit=TABLE_PREVIEW_ROWS, order_by="payment_id")
@@ -432,7 +449,7 @@ with tabs[0]:
     st.caption(f"Showing the first {len(recon_view):,} of {total_results:,} reconciliation results.")
     st.dataframe(recon_view, use_container_width=True, hide_index=True)
 
-with tabs[1]:
+if section == "Exceptions":
     st.subheader("Exception queue")
     taxonomy = metrics["exception_breakdown"]
     if taxonomy:
@@ -506,7 +523,7 @@ with tabs[1]:
             hide_index=True,
         )
 
-with tabs[2]:
+if section == "Investigation":
     # The queue holds ~1,500 rows, so filter before picking rather than scrolling a flat list.
     selected = None
     if exceptions_df.empty:
@@ -563,13 +580,18 @@ with tabs[2]:
 
         with st.container(border=True):
             st.markdown('<div class="rr-step">Step 2 &middot; AI investigation (read-only, explanation only)</div>', unsafe_allow_html=True)
-            # Rerun rather than reassigning `case`: the evidence panel is rendered in the
-            # lane above, so without a rerun it would still show the pre-investigation
-            # state while this lane showed the new result.
-            if st.button("Investigate exception", use_container_width=True):
-                with st.spinner("Running read-only investigation tools and asking Gemini..."):
-                    investigate_exception(conn, selected)
-                st.rerun()
+            # on_click rather than handling the return value: a callback runs before the
+            # script re-executes, so Step 1 above re-reads the case and shows the fresh
+            # evidence on the same pass. The earlier version called st.rerun() instead,
+            # which worked but reset st.tabs to the first tab - click Investigate and the
+            # app dropped you back on Reconciliation, away from the result you asked for.
+            st.button(
+                "Investigate exception",
+                use_container_width=True,
+                on_click=investigate_exception,
+                args=(conn, selected),
+                help="Runs the approved read-only tools, then asks Gemini to explain the exception.",
+            )
             # The stored default is "Deterministic fallback"; showing it before anything has
             # run would claim a fallback that never happened.
             has_investigated = bool(case["ai_summary"])
@@ -600,20 +622,28 @@ with tabs[2]:
             review_text = "Required before any unresolved financial issue is closed." if case["requires_human_review"] else "Gemini did not request review; RazorRecon still leaves resolution to a human."
             st.caption(review_text)
             a, b = st.columns(2)
-            # Rerun so the status, headline metrics and audit trail all reflect the
-            # decision immediately instead of lagging one interaction behind.
-            if a.button("Resolve as human reviewer", use_container_width=True):
-                human_decision(conn, selected, "resolve")
-                st.rerun()
-            if b.button("Escalate as human reviewer", use_container_width=True):
-                human_decision(conn, selected, "escalate")
-                st.rerun()
+            # Callbacks for the same reason as Investigate above: the decision is written
+            # before the script re-executes, so the status, headline metrics and audit
+            # trail all reflect it on this pass without an st.rerun() that would throw the
+            # reviewer back to the first tab.
+            a.button(
+                "Resolve as human reviewer",
+                use_container_width=True,
+                on_click=human_decision,
+                args=(conn, selected, "resolve"),
+            )
+            b.button(
+                "Escalate as human reviewer",
+                use_container_width=True,
+                on_click=human_decision,
+                args=(conn, selected, "escalate"),
+            )
 
             with st.expander("Investigation tool calls and audit history"):
                 st.dataframe(case["tool_calls"], use_container_width=True)
                 st.dataframe(case["audit_history"], use_container_width=True)
 
-with tabs[3]:
+if section == "Evaluation":
     st.subheader("Synthetic held-out benchmark")
     st.caption("The held-out split is generated reproducibly but its labels are never supplied to the reconciliation engine.")
     # A plain st.stop() here would abort the whole script and blank the Audit tab,
@@ -653,7 +683,7 @@ with tabs[3]:
         with st.expander("Full held-out metrics"):
             st.json(held_out)
 
-with tabs[4]:
+if section == "Audit":
     st.subheader("Audit events")
     st.caption(
         "Every benchmark load, reconciliation run, investigation, Gemini fallback and human "

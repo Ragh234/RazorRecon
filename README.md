@@ -49,9 +49,12 @@ Docs:
 
 Verified against official Google AI documentation on 2026-08-28:
 
-- Model: `gemini-3.5-flash-lite`, selected as a stable low-cost Flash-Lite model with structured output support.
+- Model: `gemini-3.5-flash-lite`, selected as a stable low-cost Flash-Lite model with structured output support. `gemini-3.5-flash` is tried only when Flash-Lite is unavailable; see Failure Recovery.
 - API: `POST https://generativelanguage.googleapis.com/v1beta/interactions`.
 - Structured JSON output is requested with top-level `response_format`.
+- `max_output_tokens` is 8192. This has to cover the slower model's thinking tokens, not just the JSON body.
+
+Exercised against the live API on 2026-09-04: an investigation returned `HTTP 200` with schema-valid structured output, root cause `FEE_TAX_DISCREPANCY` at confidence 0.95 with `requires_human_review` set.
 
 Docs:
 
@@ -145,13 +148,15 @@ If `LLM_API_KEY` is absent, the API request fails, the response is malformed, or
 
 ## Failure Recovery
 
-Three real failures were found, reproduced, and fixed with a permanent regression test, not just handled in theory.
+Four real failures were found, reproduced, and fixed with a permanent regression test, not just handled in theory.
 
 **Gemini failure.** If `LLM_API_KEY` is missing, the API call errors, the response is malformed, or the structured output fails schema validation, investigation falls back to the deterministic evidence-grounded classifier instead of crashing or guessing. The fallback reason is written to the audit trail (`GEMINI_FALLBACK`), never fed back into a prompt, and never shown as evidence. All three failure paths are covered by tests: `test_malformed_gemini_response_falls_back`, `test_gemini_api_failure_uses_deterministic_fallback`, `test_gemini_structured_output_validation_rejects_invalid_fields`.
 
 **Concurrent cold-start crash.** `@st.cache_resource` hands every Streamlit session the same SQLite connection, and each session runs in its own thread. Two sessions hitting a cold start together both saw an empty benchmark table and both called `load_benchmark` on that shared connection at once, unsynchronized. Their insert loops interleaved and collided on the same deterministic `payment_id` sequence, crashing the app with `sqlite3.IntegrityError: UNIQUE constraint failed`. Reproduced deterministically with 8 threads sharing one connection. Fixed with a single process-wide lock (cached the same way as the connection itself) around the bootstrap section: one thread rebuilds, the rest wait and then see the result. Covered by `test_concurrent_cold_starts_on_a_shared_connection_need_a_lock`.
 
 **Colliding audit-trail ids.** Audit ids were built as `audit_{unix_second}_{randint(1000, 9999)}`, which is only 9,000 distinct ids per second, and `audit_events.id` is a primary key. Audit rows are written in bursts inside a single second: `investigate_exception` alone writes `EXCEPTION_INVESTIGATED` and `GEMINI_FALLBACK` back to back, so a run writes four rows sharing one timestamp. Two rows drawing the same number raised `sqlite3.IntegrityError: UNIQUE constraint failed: audit_events.id`. This first appeared as a test that failed roughly one run in three and passed in isolation, which is the misleading part: the real cost was in the app, because the audit write happens on every investigation and every human decision, so a collision would crash the action a reviewer had just taken and lose the record of it. Reproduced deterministically by pinning the random draw, and measured on the old scheme at 2,000 writes in one second, where the first collision arrived at write 203. Fixed by replacing the random suffix with `uuid4`, removing the birthday problem rather than narrowing it. The same 9,000-value pattern was fixed in the Razorpay recon path, where unidentified rows shared an `insert or replace` key and silently overwrote each other instead of raising. Covered by `test_audit_ids_do_not_collide_within_a_single_second`.
+
+**Gemini capacity treated as an answer.** Every investigation was falling back to the deterministic classifier. The audit trail held the reason: read timeouts at the old 20s ceiling, and `HTTP 500` responses whose body read `gemini-3.5-flash-lite is currently experiencing high demand`. That is capacity pressure on one model at Google, not a bad key or a malformed request, and the code could not tell the difference between "the model is busy" and "the model has answered". Three things were wrong. The 20s timeout cut off healthy replies, since a measured good response took 26s. A single model meant one saturated model disabled the whole AI path. And `max_output_tokens` of 2048 truncated the larger model's reply mid-string, which surfaced as `JSONDecodeError: Unterminated string` and looked like a malformed response rather than a ceiling set too low. Fixed by trying `gemini-3.5-flash-lite` on a short 15s leash and falling through to `gemini-3.5-flash` at 40s, and by raising the ceiling to 8192. Transport faults and 5xx are retried on the next model; a 4xx or a schema-validation failure is not, because those fail identically everywhere and retrying them only delays the fallback the reviewer is waiting on. The deterministic classifier is still the last resort, so the safety property is unchanged. Verified end to end after the fix: the investigation returned `Gemini AI`, root cause `FEE_TAX_DISCREPANCY`, confidence 0.95. Covered by `test_transient_gemini_timeout_is_retried_once_before_falling_back` and `test_non_transient_gemini_failure_is_not_retried`.
 
 ## Streamlit Community Cloud Deployment
 
@@ -218,7 +223,7 @@ Results should be described as: "On the included synthetic held-out benchmark...
 python -m pytest
 ```
 
-The tests cover 5,000-record generation, fixed-seed reproducibility, held-out independence and metrics, required exception classes, false-positive/false-negative safety, wrong mapping semantics, exposure-class partitioning, bank-entry referential integrity, rebuild of a partially written result set, approved investigation tools, Gemini structured validation and failure fallback, evidence recording, insufficient-evidence routing, mutation-tool blocking, audit-id uniqueness under same-second bursts, and Razorpay pagination.
+The tests cover 5,000-record generation, fixed-seed reproducibility, held-out independence and metrics, required exception classes, false-positive/false-negative safety, wrong mapping semantics, exposure-class partitioning, bank-entry referential integrity, rebuild of a partially written result set, approved investigation tools, Gemini structured validation and failure fallback, evidence recording, insufficient-evidence routing, mutation-tool blocking, audit-id uniqueness under same-second bursts, transient-versus-permanent Gemini failure handling, and Razorpay pagination.
 
 ## File Map
 
@@ -235,6 +240,7 @@ The tests cover 5,000-record generation, fixed-seed reproducibility, held-out in
 ## Known Limitations
 
 - Gemini investigation requires `LLM_API_KEY`; without it, the deterministic evidence-grounded fallback remains fully usable.
+- An investigation takes roughly 10 to 40 seconds depending on which model answers. When Flash-Lite is under load the request waits out a 15-second leash before the secondary model is tried, so a slow investigation is usually Google's capacity rather than a stall in this app.
 - Razorpay Test Mode sync requires valid Test Mode keys and actual account data; the benchmark path remains separate and reliable for demos.
 - **Test Mode cannot demonstrate the full pipeline, and this is a property of Razorpay rather than of this connector.** A Test Mode account holds no payments until a Checkout flow is completed by hand, and Razorpay does not run settlement cycles in Test Mode at all. So `GET /v1/settlements/` and `GET /v1/settlements/recon/combined` return empty collections even after test payments exist. Reconciliation needs payments matched against settlements and recon rows, so the only way to exercise every rule is the synthetic benchmark. That is why the benchmark is the demo path and the connector is kept separate from it. Verified on 2026-09-04: all three endpoints return `HTTP 200` with zero items on a Test Mode account.
 - No autonomous refunds, payouts, or financial mutations exist.

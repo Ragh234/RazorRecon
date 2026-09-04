@@ -32,6 +32,28 @@ load_env_file()
 DB_PATH = os.getenv("DATABASE_URL", "razorrecon.sqlite").replace("sqlite:///", "")
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 GEMINI_API_REVISION = "2026-05-20"
+# The audit trail showed read timeouts and repeated 500s whose body reads
+# "gemini-3.5-flash-lite is currently experiencing high demand". That is capacity
+# pressure on one model, not a bad key or a malformed request, and it sent otherwise
+# healthy investigations to the deterministic fallback. Flash-Lite stays first because
+# it is the cheap default this project documents; gemini-3.5-flash is tried next only
+# when the first is unavailable. The deterministic classifier remains the last resort,
+# so the safety property is unchanged: this only stops a capacity spike at Google from
+# being mistaken for an answer.
+# (model, timeout) pairs, tried in order. Flash-Lite is the fast model, so 15s is a
+# generous ceiling for a healthy one; keeping its leash short means a saturated
+# Flash-Lite costs 15s rather than 40 before the secondary is tried, which is the
+# difference between a ~30s investigation and a ~66s one in front of a reviewer.
+GEMINI_MODELS = (("gemini-3.5-flash-lite", 15), ("gemini-3.5-flash", 40))
+# Measured: a healthy gemini-3.5-flash reply took 26s, so a 20s ceiling was cutting off
+# responses that were about to succeed.
+GEMINI_TIMEOUT_SECONDS = 40
+# Headroom for the JSON body plus any thinking tokens. At 2048 the secondary model
+# returned HTTP 200 with a truncated body, which surfaced as
+# "JSONDecodeError: Unterminated string" and looked like a malformed response rather
+# than a ceiling that was simply too low. gemini-3.5-flash thinks more than Flash-Lite,
+# so the ceiling has to cover the slower of the two models, not the cheaper one.
+GEMINI_MAX_OUTPUT_TOKENS = 8192
 BENCHMARK_RECORDS = 5_000
 BENCHMARK_SEED = 42
 HELD_OUT_FRACTION = 0.20
@@ -631,7 +653,46 @@ def investigate_exception(db: sqlite3.Connection, exception_id: str) -> dict[str
     return get_exception(db, exception_id)
 
 
+def gemini_failure_is_transient(reason: str) -> bool:
+    """Is this failure worth one more attempt, or is it a settled answer?
+
+    Transport faults and 5xx are the network being unreliable. A 4xx (bad key, quota,
+    bad request) and a schema-validation failure are deterministic: retrying them just
+    delays the fallback the reviewer is waiting on.
+    """
+    transient_markers = (
+        "Timeout",
+        "ConnectionError",
+        "500 Server Error",
+        "502 Server Error",
+        "503 Server Error",
+        "504 Server Error",
+    )
+    return any(marker in reason for marker in transient_markers)
+
+
 def gemini_investigation(case: dict[str, Any], evidence: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, str | None]:
+    """Ask Gemini, retrying once when the failure was transport rather than answer.
+
+    The deterministic fallback below is the safety net and stays exactly as it was; this
+    only stops a single dropped connection from being treated as a verdict.
+    """
+    reason = None
+    for index, (model, timeout) in enumerate(GEMINI_MODELS):
+        result, reason = gemini_attempt(case, evidence, model, timeout)
+        # result means success; reason None with no result means no key configured,
+        # which is the normal unconfigured path and must not be retried or logged.
+        if result is not None or reason is None:
+            return result, reason
+        # Only capacity and transport faults are worth another model. A 401 or a schema
+        # validation failure will fail identically on every model.
+        if index + 1 < len(GEMINI_MODELS) and gemini_failure_is_transient(reason):
+            continue
+        break
+    return None, reason
+
+
+def gemini_attempt(case: dict[str, Any], evidence: list[dict[str, Any]], model: str = GEMINI_MODEL, timeout: int = GEMINI_TIMEOUT_SECONDS) -> tuple[dict[str, Any] | None, str | None]:
     api_key = os.getenv("LLM_API_KEY")
     if not api_key:
         return None, None
@@ -686,7 +747,7 @@ def gemini_investigation(case: dict[str, Any], evidence: list[dict[str, Any]]) -
                 "Api-Revision": GEMINI_API_REVISION,
             },
             json={
-                "model": GEMINI_MODEL,
+                "model": model,
                 "input": json.dumps(prompt),
                 "response_format": {
                     "type": "text",
@@ -695,9 +756,9 @@ def gemini_investigation(case: dict[str, Any], evidence: list[dict[str, Any]]) -
                 },
                 # Headroom for the JSON body plus any thinking tokens; too low a
                 # ceiling truncates the response and reads as a validation failure.
-                "generation_config": {"max_output_tokens": 2048},
+                "generation_config": {"max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS},
             },
-            timeout=20,
+            timeout=timeout,
         )
         response.raise_for_status()
         payload = response.json()
