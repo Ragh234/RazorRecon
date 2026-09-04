@@ -37,6 +37,8 @@ Verified against official Razorpay documentation on 2026-08-27:
 - Fetch settlement reconciliation: `GET /v1/settlements/recon/combined` with required `year`, `month`, optional `day`, `count`, and `skip`.
 - Settlement recon rows can include `payment`, `refund`, `transfer`, and `adjustment` transaction types.
 
+Additionally exercised against the live Razorpay API with Test Mode credentials on 2026-09-04. All three endpoints authenticated and returned `HTTP 200` with a well-formed `entity: "collection"` envelope, called both directly and through `core.RazorpayClient`. `POST /v1/orders` also returns `HTTP 200`, so the credentials carry write scope. These are live-API results, not documentation readings.
+
 Docs:
 
 - https://razorpay.com/docs/api/payments/fetch-all-payments/
@@ -232,6 +234,7 @@ The tests cover 5,000-record generation, fixed-seed reproducibility, held-out in
 
 - Gemini investigation requires `LLM_API_KEY`; without it, the deterministic evidence-grounded fallback remains fully usable.
 - Razorpay Test Mode sync requires valid Test Mode keys and actual account data; the benchmark path remains separate and reliable for demos.
+- **Test Mode cannot demonstrate the full pipeline, and this is a property of Razorpay rather than of this connector.** A Test Mode account holds no payments until a Checkout flow is completed by hand, and Razorpay does not run settlement cycles in Test Mode at all. So `GET /v1/settlements/` and `GET /v1/settlements/recon/combined` return empty collections even after test payments exist. Reconciliation needs payments matched against settlements and recon rows, so the only way to exercise every rule is the synthetic benchmark. That is why the benchmark is the demo path and the connector is kept separate from it. Verified on 2026-09-04: all three endpoints return `HTTP 200` with zero items on a Test Mode account.
 - No autonomous refunds, payouts, or financial mutations exist.
 - Synthetic benchmark behavior does not establish performance or accuracy on production Razorpay or bank data.
 - The benchmark scores 100% accuracy, precision, and recall by construction: every scenario the generator produces is drawn from the failure modes the deterministic rules already cover. That result demonstrates rule coverage and guards against regressions. It is not evidence of accuracy on real data, which contains failure modes this generator does not create.

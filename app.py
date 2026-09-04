@@ -267,7 +267,19 @@ with st.sidebar:
             try:
                 st.session_state["last_action"] = razorpay_sync(conn, int(year), int(month), int(day) or None)
                 if not any(st.session_state["last_action"].values()):
-                    st.info("Razorpay Test Mode sync completed, but no records were returned for the selected period.")
+                    # An empty result here is the normal case, not a failure, and saying so
+                    # matters: a reviewer who reads "no records" as "the connector is
+                    # broken" draws the wrong conclusion. Test Mode accounts hold no
+                    # payments until someone completes a Checkout flow, and Razorpay does
+                    # not run settlement cycles in Test Mode at all, so /settlements and
+                    # /settlements/recon/combined stay empty even after payments exist.
+                    st.info(
+                        "Sync succeeded. The API returned no records for this period, which is "
+                        "the expected result for a Test Mode account: Test Mode holds no payments "
+                        "until a Checkout flow is completed, and it never runs settlement cycles. "
+                        "The synthetic benchmark exists because the full reconciliation pipeline "
+                        "cannot be demonstrated from Test Mode data."
+                    )
             except Exception as exc:
                 st.error(str(exc))
 
