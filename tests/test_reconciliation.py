@@ -6,6 +6,7 @@ import requests
 from core import (
     APPROVED_TOOLS,
     RazorpayClient,
+    audit,
     connect,
     evaluation,
     get_exception,
@@ -397,6 +398,29 @@ def test_gemini_structured_output_validation_rejects_invalid_fields():
     }
 
     assert validate_llm_result(invalid) is None
+
+
+def test_audit_ids_do_not_collide_within_a_single_second():
+    """Audit ids used a second-precision timestamp plus randint(1000, 9999).
+
+    That is 9,000 ids per second, and audit rows are written in bursts inside one
+    second: investigate_exception writes EXCEPTION_INVESTIGATED and GEMINI_FALLBACK
+    back to back. Two rows in the same second collided about once in 9,000 and raised
+    "UNIQUE constraint failed: audit_events.id", which showed up as an intermittent
+    test failure and would crash a real investigation or human decision in the app.
+
+    2,000 writes inside one second would have collided with ~99.9% probability under
+    the old scheme, so this fails loudly if the id ever narrows again.
+    """
+    db = fresh_db()
+    for index in range(2000):
+        audit(db, "actor", "ACTION", f"entity_{index}", None, {"n": index})
+    db.commit()
+
+    total = db.execute("select count(*) from audit_events").fetchone()[0]
+    distinct = db.execute("select count(distinct id) from audit_events").fetchone()[0]
+    assert total == 2000
+    assert distinct == 2000
 
 
 def test_gemini_api_failure_uses_deterministic_fallback(monkeypatch):

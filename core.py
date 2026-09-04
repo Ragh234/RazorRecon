@@ -5,6 +5,7 @@ import os
 import random
 import sqlite3
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -233,7 +234,17 @@ def audit(db: sqlite3.Connection, actor: str, action: str, entity_id: str, befor
     db.execute(
         "insert into audit_events values (?, ?, ?, ?, ?, ?, ?)",
         (
-            f"audit_{now_ts()}_{random.randint(1000, 9999)}",
+            # audit_events.id is a primary key, and audit rows are written in bursts
+            # inside a single second: investigate_exception alone writes
+            # EXCEPTION_INVESTIGATED and GEMINI_FALLBACK back to back. A second-precision
+            # timestamp plus random.randint(1000, 9999) gives only 9,000 distinct ids per
+            # second, so two rows in the same second collide roughly once in 9,000 and
+            # raise "UNIQUE constraint failed: audit_events.id". That surfaced as an
+            # intermittent test failure, but the real cost is in the app: the audit write
+            # happens on every investigation and every human decision, so a collision
+            # crashes the action a reviewer just took. uuid4 removes the birthday problem
+            # instead of narrowing it.
+            f"audit_{now_ts()}_{uuid.uuid4().hex[:12]}",
             actor,
             action,
             entity_id,
@@ -923,7 +934,11 @@ def normalize_razorpay_payload(db: sqlite3.Connection, payments: dict[str, Any],
         )
     for item in recon_payload.get("items", []):
         entity_type = item.get("type") or "payment"
-        entity_id = item.get("entity_id") or f"unknown_{random.randint(1000,9999)}"
+        # Same 9,000-value birthday problem as the audit id, with a quieter failure: the
+        # record id below is built from entity_id and written with "insert or replace",
+        # so two unidentified recon rows drawing the same number silently overwrite each
+        # other and a reconciliation record disappears rather than raising.
+        entity_id = item.get("entity_id") or f"unknown_{uuid.uuid4().hex[:12]}"
         payment_id = item.get("payment_id") or (entity_id if entity_type == "payment" else None)
         db.execute(
             "insert or replace into reconciliation_records values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",

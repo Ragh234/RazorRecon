@@ -145,11 +145,13 @@ If `LLM_API_KEY` is absent, the API request fails, the response is malformed, or
 
 ## Failure Recovery
 
-Two real failures were found, reproduced, and fixed with a permanent regression test, not just handled in theory.
+Three real failures were found, reproduced, and fixed with a permanent regression test, not just handled in theory.
 
 **Gemini failure.** If `LLM_API_KEY` is missing, the API call errors, the response is malformed, or the structured output fails schema validation, investigation falls back to the deterministic evidence-grounded classifier instead of crashing or guessing. The fallback reason is written to the audit trail (`GEMINI_FALLBACK`), never fed back into a prompt, and never shown as evidence. All three failure paths are covered by tests: `test_malformed_gemini_response_falls_back`, `test_gemini_api_failure_uses_deterministic_fallback`, `test_gemini_structured_output_validation_rejects_invalid_fields`.
 
 **Concurrent cold-start crash.** `@st.cache_resource` hands every Streamlit session the same SQLite connection, and each session runs in its own thread. Two sessions hitting a cold start together both saw an empty benchmark table and both called `load_benchmark` on that shared connection at once, unsynchronized. Their insert loops interleaved and collided on the same deterministic `payment_id` sequence, crashing the app with `sqlite3.IntegrityError: UNIQUE constraint failed`. Reproduced deterministically with 8 threads sharing one connection. Fixed with a single process-wide lock (cached the same way as the connection itself) around the bootstrap section: one thread rebuilds, the rest wait and then see the result. Covered by `test_concurrent_cold_starts_on_a_shared_connection_need_a_lock`.
+
+**Colliding audit-trail ids.** Audit ids were built as `audit_{unix_second}_{randint(1000, 9999)}`, which is only 9,000 distinct ids per second, and `audit_events.id` is a primary key. Audit rows are written in bursts inside a single second: `investigate_exception` alone writes `EXCEPTION_INVESTIGATED` and `GEMINI_FALLBACK` back to back, so a run writes four rows sharing one timestamp. Two rows drawing the same number raised `sqlite3.IntegrityError: UNIQUE constraint failed: audit_events.id`. This first appeared as a test that failed roughly one run in three and passed in isolation, which is the misleading part: the real cost was in the app, because the audit write happens on every investigation and every human decision, so a collision would crash the action a reviewer had just taken and lose the record of it. Reproduced deterministically by pinning the random draw, and measured on the old scheme at 2,000 writes in one second, where the first collision arrived at write 203. Fixed by replacing the random suffix with `uuid4`, removing the birthday problem rather than narrowing it. The same 9,000-value pattern was fixed in the Razorpay recon path, where unidentified rows shared an `insert or replace` key and silently overwrote each other instead of raising. Covered by `test_audit_ids_do_not_collide_within_a_single_second`.
 
 ## Streamlit Community Cloud Deployment
 
@@ -216,7 +218,7 @@ Results should be described as: "On the included synthetic held-out benchmark...
 python -m pytest
 ```
 
-The tests cover 5,000-record generation, fixed-seed reproducibility, held-out independence and metrics, required exception classes, false-positive/false-negative safety, wrong mapping semantics, exposure-class partitioning, bank-entry referential integrity, rebuild of a partially written result set, approved investigation tools, Gemini structured validation and failure fallback, evidence recording, insufficient-evidence routing, mutation-tool blocking, and Razorpay pagination.
+The tests cover 5,000-record generation, fixed-seed reproducibility, held-out independence and metrics, required exception classes, false-positive/false-negative safety, wrong mapping semantics, exposure-class partitioning, bank-entry referential integrity, rebuild of a partially written result set, approved investigation tools, Gemini structured validation and failure fallback, evidence recording, insufficient-evidence routing, mutation-tool blocking, audit-id uniqueness under same-second bursts, and Razorpay pagination.
 
 ## File Map
 
