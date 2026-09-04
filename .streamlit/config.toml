@@ -1,0 +1,18 @@
+# Dark base: exception and at-risk states need to read as warnings against a calm
+# ground. The default light theme renders every metric card identically, which is
+# how the exposure split ended up invisible.
+[theme]
+base = "dark"
+primaryColor = "#3B82F6"
+backgroundColor = "#0B1220"
+secondaryBackgroundColor = "#141E33"
+textColor = "#E6EDF7"
+font = "sans serif"
+
+[server]
+# The benchmark tables are wide; stop Streamlit from warning about message size
+# on a free-tier host where the 500-row previews are already the guard.
+maxMessageSize = 300
+
+[browser]
+gatherUsageStats = false

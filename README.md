@@ -164,6 +164,7 @@ Required repository files for deployment:
 - `tests/test_reconciliation.py`
 - `README.md`
 - `assets/architecture.svg`
+- `.streamlit/config.toml`
 - `.env.example`
 - `.gitignore`
 
@@ -223,6 +224,7 @@ The tests cover 5,000-record generation, fixed-seed reproducibility, held-out in
 - `tests/test_reconciliation.py` - focused tests for critical financial and guardrail behavior.
 - `.github/workflows/tests.yml` - runs the test suite on every push and pull request.
 - `assets/architecture.svg` - the pipeline diagram referenced above.
+- `.streamlit/config.toml` - dashboard theme. Committed deliberately: without it the deployed app falls back to the default Streamlit palette, in which the exposure classes lose their colour coding.
 - `.env.example` - required configuration shape.
 - `.gitignore` - excludes secrets, local DBs, caches, and generated artifacts.
 
