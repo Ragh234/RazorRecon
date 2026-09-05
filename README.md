@@ -15,6 +15,8 @@ RazorRecon is a compact AI Finance Controller demo for Razorpay reconciliation. 
 
 ![RazorRecon reconciliation pipeline: Razorpay Test Mode API and a synthetic benchmark feed data ingestion, which feeds deterministic reconciliation in Python — the financial source of truth. Matched payments close automatically; exceptions go to Gemini AI investigation, which works only from read-only verified evidence and falls back deterministically on any failure. Every case ends in human review (resolve or escalate), and every step is written to the audit trail.](assets/architecture.svg)
 
+Full design rationale — the trust boundary, the approved read-only tool set, exposure classification, and the model fallback ladder — is in [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Features
 
 - Reproducible synthetic benchmark with 5,000 varied payments, a fixed seed, and separate development and held-out splits.
@@ -247,3 +249,12 @@ The tests cover 5,000-record generation, fixed-seed reproducibility, held-out in
 - Synthetic benchmark behavior does not establish performance or accuracy on production Razorpay or bank data.
 - The benchmark scores 100% accuracy, precision, and recall by construction: every scenario the generator produces is drawn from the failure modes the deterministic rules already cover. That result demonstrates rule coverage and guards against regressions. It is not evidence of accuracy on real data, which contains failure modes this generator does not create.
 - Throughput is machine-dependent and is measured for the complete local benchmark run, not claimed as a service-level guarantee.
+
+### Matcher scope
+
+Limits of the matching logic itself, separate from the data and accuracy limits above:
+
+- **Fixed timing window.** The timing rule is a fixed seven-day deterministic window. Real settlement cycles vary by merchant, method, and payout schedule, and would need to be configurable.
+- **No fuzzy matching.** Matching is by exact key and derived arithmetic. A reconciliation row whose identifier has been corrupted or reformatted surfaces as `MISSING_RECONCILIATION_RECORD` rather than being recovered.
+- **No batch decomposition.** A payment is assumed to map to a settlement. Consolidated payouts, where many payments net into a single bank credit, are not decomposed into their components and would present as amount discrepancies.
+- **Single currency.** Amounts are integer paise, single-currency. Multi-currency settlement and FX differences are not modelled.
