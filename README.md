@@ -11,6 +11,8 @@ Deployed Link : https://razorrecon.streamlit.app/
 
 RazorRecon is a compact AI Finance Controller demo for Razorpay reconciliation. It keeps financial truth deterministic and uses a constrained investigator only to explain exceptions from read-only evidence.
 
+Reconciliation is multi-source. Every payment is checked against four separate record sets: the captured payment, the settlement reconciliation records that map it, the settlement itself, and the bank entry behind that settlement. A payment only matches when the linkage and the arithmetic agree across all four; a disagreement at any one of them produces a typed exception rather than a silent pass.
+
 ## Architecture
 
 ![RazorRecon reconciliation pipeline: Razorpay Test Mode API and a synthetic benchmark feed data ingestion, which feeds deterministic reconciliation in Python — the financial source of truth. Matched payments close automatically; exceptions go to Gemini AI investigation, which works only from read-only verified evidence and falls back deterministically on any failure. Every case ends in human review (resolve or escalate), and every step is written to the audit trail.](assets/architecture.svg)
@@ -118,6 +120,8 @@ The included benchmark is entirely synthetic. It is designed to make reconciliat
 
 This is not one cherry-picked match: every one of the 5,000 records is reconciled on each run, and every one of the 1,000 held-out records is scored against labels the reconciliation engine never saw.
 
+Nor is it one lucky seed. The headline figures are reported from seed `42`, so `test_accuracy_holds_across_independent_seeds` re-runs generation, reconciliation and held-out scoring on six unrelated seeds (`7`, `42`, `101`, `2024`, `31337`, `90210`) and requires 100% accuracy, precision and recall with zero false positives and zero false negatives on every one. The same test also fingerprints the generated payment amounts and fails if any two seeds produce identical data, so the check cannot pass by scoring six copies of the same dataset.
+
 The held-out set is scored independently after reconciliation. Reported metrics include total records, matches, exceptions, match rate, exact classification accuracy, exception precision and recall, false positives, false negatives, measured throughput, unresolved exception count/value, and exception counts by type.
 
 Metric definitions:
@@ -127,6 +131,8 @@ Metric definitions:
 - **Recall**: detected ground-truth exceptions divided by all ground-truth exceptions.
 - **Unresolved value**: sum of the absolute reconciliation differences for open, human-review, or escalated exceptions. It is an exposure indicator, not a ledger balance, and it is reported split by exposure class rather than as one number.
 - **Throughput**: always measured over the whole reconciliation run. A split is scored afterwards from stored results, so it has no separate timing of its own.
+
+Throughput here is a full-pipeline figure, not an in-memory matching rate, so it is not comparable to benchmarks that time matching alone. The timed window covers clearing prior results, reading every payment, running roughly six SQLite queries per payment for related records, settlement, bank entry and expected-settlement arithmetic, and writing one reconciliation result row per payment plus one exception row per exception. On the default 5,000-record benchmark that is about 30,000 queries and 6,500 row inserts inside the measurement, all persisted to SQLite rather than held in memory.
 
 ### Exposure Classes
 
@@ -225,7 +231,7 @@ Results should be described as: "On the included synthetic held-out benchmark...
 python -m pytest
 ```
 
-The tests cover 5,000-record generation, fixed-seed reproducibility, held-out independence and metrics, required exception classes, false-positive/false-negative safety, wrong mapping semantics, exposure-class partitioning, bank-entry referential integrity, rebuild of a partially written result set, approved investigation tools, Gemini structured validation and failure fallback, evidence recording, insufficient-evidence routing, mutation-tool blocking, audit-id uniqueness under same-second bursts, transient-versus-permanent Gemini failure handling, and Razorpay pagination.
+The tests cover 5,000-record generation, fixed-seed reproducibility, multi-seed accuracy stability across six unrelated seeds, held-out independence and metrics, required exception classes, false-positive/false-negative safety, wrong mapping semantics, exposure-class partitioning, bank-entry referential integrity, rebuild of a partially written result set, approved investigation tools, Gemini structured validation and failure fallback, evidence recording, insufficient-evidence routing, mutation-tool blocking, audit-id uniqueness under same-second bursts, transient-versus-permanent Gemini failure handling, and Razorpay pagination.
 
 ## File Map
 

@@ -66,6 +66,38 @@ def test_benchmark_is_reproducible_with_fixed_seed():
     assert [tuple(item) for item in rows(first, query)] == [tuple(item) for item in rows(second, query)]
 
 
+def test_accuracy_holds_across_independent_seeds():
+    # The headline 100% is reported from seed 42. On its own that invites the fair
+    # question of whether the number is a property of the rules or an artifact of one
+    # lucky dataset. Scoring several unrelated seeds answers it: the rules cover every
+    # scenario the generator can produce, so the result should not move with the seed.
+    seeds = (7, 42, 101, 2024, 31337, 90210)
+    fingerprints = {}
+
+    for seed in seeds:
+        db = connect(":memory:")
+        init_db(db)
+        load_benchmark(db, records=550, seed=seed)
+        reconcile(db)
+
+        held_out = evaluation(db, "held_out")
+        assert held_out["reconciliation_accuracy"] == 100.0, f"accuracy moved on seed {seed}"
+        assert held_out["exception_precision"] == 100.0, f"precision moved on seed {seed}"
+        assert held_out["exception_recall"] == 100.0, f"recall moved on seed {seed}"
+        assert held_out["false_positives"] == 0, f"false positive on seed {seed}"
+        assert held_out["false_negatives"] == 0, f"false negative on seed {seed}"
+
+        # Record the actual generated amounts so the assertions above cannot be
+        # satisfied by six copies of the same dataset.
+        fingerprints[seed] = tuple(
+            r["amount"] for r in rows(db, "select amount from payments order by id limit 40")
+        )
+
+    assert len(set(fingerprints.values())) == len(seeds), (
+        "seeds produced identical payment data, so the multi-seed check proves nothing"
+    )
+
+
 def test_held_out_evaluation_is_complete_and_independent():
     db = fresh_db()
     load_benchmark(db, records=550, seed=42)
